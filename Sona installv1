@@ -1,0 +1,210 @@
+#!/bin/bash
+set -euo pipefail
+
+echo "Welcome to the Sona Linux Installer — accessible, Arch-based, and beginner-friendly."
+
+# === Check for whiptail ===
+if command -v whiptail >/dev/null 2>&1; then
+  USE_WHIPTAIL=true
+else
+  USE_WHIPTAIL=false
+fi
+
+# === Full name ===
+if [ "$USE_WHIPTAIL" = true ]; then
+  FULLNAME=$(whiptail --inputbox "Enter your full name:" 10 60 "" 3>&1 1>&2 2>&3)
+else
+  read -rp "Enter your full name: " FULLNAME
+fi
+
+# === Username ===
+if [ "$USE_WHIPTAIL" = true ]; then
+  USERNAME=$(whiptail --inputbox "Choose a username:" 10 60 "sonauser" 3>&1 1>&2 2>&3)
+else
+  read -rp "Enter username: " USERNAME
+fi
+USERNAME=${USERNAME,,}
+
+# === Password ===
+while true; do
+  if [ "$USE_WHIPTAIL" = true ]; then
+    PASSWORD=$(whiptail --passwordbox "Enter password:" 10 60 3>&1 1>&2 2>&3)
+    CONFIRM=$(whiptail --passwordbox "Confirm password:" 10 60 3>&1 1>&2 2>&3)
+  else
+    read -rsp "Enter password: " PASSWORD; echo
+    read -rsp "Confirm password: " CONFIRM; echo
+  fi
+  [[ "$PASSWORD" == "$CONFIRM" ]] && break
+  echo "Passwords do not match."
+done
+
+# === Hostname ===
+if [ "$USE_WHIPTAIL" = true ]; then
+  HOSTNAME=$(whiptail --inputbox "Enter system hostname:" 10 60 "sona" 3>&1 1>&2 2>&3)
+else
+  read -rp "Enter hostname: " HOSTNAME
+fi
+
+# === Timezone ===
+if [ "$USE_WHIPTAIL" = true ]; then
+  TIMEZONE=$(whiptail --menu "Select your time zone:" 15 50 6 \
+    "UTC" "Coordinated Universal Time" \
+    "America/New_York" "Eastern (New York)" \
+    "America/Chicago" "Central (Chicago)" \
+    "America/Denver" "Mountain (Denver)" \
+    "America/Los_Angeles" "Pacific (LA)" \
+    "Manual" "Enter manually" \
+    3>&1 1>&2 2>&3)
+  [[ "$TIMEZONE" == "Manual" ]] && TIMEZONE=$(whiptail --inputbox "Enter full timezone (e.g., Europe/London):" 10 60 "" 3>&1 1>&2 2>&3)
+else
+  echo "Select your time zone:"
+  select T in UTC America/New_York America/Chicago America/Denver America/Los_Angeles Manual; do
+    [[ "$T" == "Manual" ]] && read -rp "Enter timezone: " TIMEZONE && break TIMEZONE=$T && break
+  done
+fi
+
+# === Disk selection ===
+echo "Available disks:"
+lsblk -d -e 7,11 -o NAME,SIZE,MODEL | nl
+read -rp "Enter disk number: " DISK_NUM
+DISK_NAME=$(lsblk -d -e 7,11 -o NAME | sed -n "${DISK_NUM}p")
+DISK="/dev/$DISK_NAME"
+
+# === Dual boot ===
+read -rp "Dual-boot with Windows or another OS? (y/N): " DUALBOOT
+DUALBOOT=${DUALBOOT,,}
+if [[ "$DUALBOOT" == "y" || "$DUALBOOT" == "yes" ]]; then
+  lsblk -f
+  read -rp "Enter EFI partition (e.g. /dev/sda1): " EFI_PART
+  read -rp "Enter root partition (e.g. /dev/sda5): " ROOT_PART
+  mkfs.ext4 "$ROOT_PART"
+  mount "$ROOT_PART" /mnt
+  mkdir -p /mnt/boot
+  mount "$EFI_PART" /mnt/boot
+else
+  read -rp "WARNING: This will erase $DISK. Continue? (y/N): " confirm
+  [[ "$confirm" =~ ^[Yy]$ ]] || exit 1
+  parted --script "$DISK" \
+    mklabel gpt \
+    mkpart primary fat32 1MiB 513MiB \
+    set 1 esp on \
+    mkpart primary ext4 513MiB 100%
+  mkfs.fat -F32 "${DISK}p1"
+  mkfs.ext4 -F "${DISK}p2"
+  mount "${DISK}p2" /mnt
+  mkdir -p /mnt/boot
+  mount "${DISK}p1" /mnt/boot
+fi
+
+# === Desktop ===
+if [ "$USE_WHIPTAIL" = true ]; then
+  DE=$(whiptail --menu "Desktop Environment:" 15 50 3 \
+    "mate" "MATE" \
+    "xfce" "XFCE" \
+    "gnome" "GNOME" \
+    3>&1 1>&2 2>&3)
+else
+  select D in mate xfce gnome; do DE=$D; break; done
+fi
+
+# === Optional components ===
+read -rp "Enable autologin? (y/N): " AUTOLOGIN
+read -rp "Enable Bluetooth? (y/N): " ENABLE_BT
+read -rp "Install Flatpak? (y/N): " ENABLE_FLATPAK
+read -rp "Install VirtualBox? (y/N): " INSTALL_VBOX
+
+# === Base system install ===
+pacstrap /mnt base linux linux-firmware sudo networkmanager grub os-prober efibootmgr xdg-user-dirs xdg-utils
+genfstab -U /mnt >> /mnt/etc/fstab
+
+# === GRUB Boot Mode ===
+if [ -d /sys/firmware/efi ]; then
+  BOOTMODE="uefi"
+else
+  BOOTMODE="bios"
+fi
+
+# === Chroot Setup ===
+arch-chroot /mnt /bin/bash <<EOF
+ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime
+hwclock --systohc
+echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
+locale-gen
+echo "LANG=en_US.UTF-8" > /etc/locale.conf
+echo "$HOSTNAME" > /etc/hostname
+systemctl enable NetworkManager
+
+echo "root:$PASSWORD" | chpasswd
+useradd -m -c "$FULLNAME" -G wheel,audio,video,storage $USERNAME
+echo "$USERNAME:$PASSWORD" | chpasswd
+echo "%wheel ALL=(ALL) ALL" >> /etc/sudoers
+
+# === Desktop and Accessibility ===
+pacman -Sy --noconfirm xorg xorg-xinit speech-dispatcher orca espeak brltty gnome-terminal
+
+[[ "$DE" == "mate" ]] && pacman -S --noconfirm mate mate-extra lightdm lightdm-gtk-greeter pamac-gtk network-manager-applet
+[[ "$DE" == "xfce" ]] && pacman -S --noconfirm xfce4 xfce4-goodies lightdm lightdm-gtk-greeter pamac-gtk network-manager-applet
+[[ "$DE" == "gnome" ]] && pacman -S --noconfirm gnome gdm pamac-gtk && systemctl enable gdm
+[[ "$DE" != "gnome" ]] && systemctl enable lightdm
+
+# === Orca autostart ===
+mkdir -p /home/$USERNAME/.config/autostart
+cat > /home/$USERNAME/.config/autostart/orca.desktop <<AUTOSTART
+[Desktop Entry]
+Type=Application
+Name=Orca Screen Reader Exec=orca
+X-GNOME-Autostart-enabled=true
+AUTOSTART
+chown -R $USERNAME:$USERNAME /home/$USERNAME
+
+# === GRUB beep ===
+echo 'echo -e "\a"' >> /etc/grub.d/00_header
+modprobe pcspkr
+echo pcspkr >> /etc/modules-load.d/pcspkr.conf
+
+# === Bluetooth ===
+[[ "$ENABLE_BT" == "y" || "$ENABLE_BT" == "yes" ]] && \
+pacman -S --noconfirm bluez bluez-utils pulseaudio-bluetooth && systemctl enable bluetooth
+
+# === Flatpak ===
+if [[ "$ENABLE_FLATPAK" == "y" || "$ENABLE_FLATPAK" == "yes" ]]; then
+  pacman -S --noconfirm flatpak
+  flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+fi
+
+# === VirtualBox ===
+if [[ "$INSTALL_VBOX" == "y" || "$INSTALL_VBOX" == "yes" ]]; then
+  pacman -S --noconfirm virtualbox virtualbox-host-modules-arch
+  usermod -aG vboxusers $USERNAME
+fi
+
+# === VMware / VirtualBox Guest Tools ===
+if systemd-detect-virt | grep -q vmware; then
+  pacman -S --noconfirm open-vm-tools && systemctl enable vmtoolsd
+elif systemd-detect-virt | grep -q oracle; then  pacman -S --noconfirm virtualbox-guest-utils && systemctl enable vboxservice
+fi
+
+# === Common Apps ===
+pacman -S --noconfirm firefox libreoffice-fresh thunderbird wget git unzip zip p7zip htop rsync
+
+# === Autologin ===
+if [[ "$AUTOLOGIN" == "y" || "$AUTOLOGIN" == "yes" && "$DE" != "gnome" ]]; then
+mkdir -p /etc/lightdm/lightdm.conf.d
+cat > /etc/lightdm/lightdm.conf.d/50-autologin.conf <<AUTOLOGIN
+[Seat:*]
+autologin-user=$USERNAME
+autologin-session=$DE
+AUTOLOGIN
+fi
+
+# === GRUB Install (UEFI or BIOS) ===
+if [[ "$BOOTMODE" == "uefi" ]]; then
+  grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
+else
+  grub-install --target=i386-pc --recheck $DISK
+fi
+
+grub-mkconfig -o /boot/grub/grub.cfg
+EOF
+
+echo "Sona Linux installation complete! Reboot into your new system. Welcome!"
