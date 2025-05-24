@@ -2,19 +2,28 @@
 set -euo pipefail
 
 log() { echo -e "\n==> $1"; }
-error_exit() { echo "❌ ERROR: $1"; exit 1; }
+error_exit() { echo "❌ $1"; exit 1; }
 
-# Welcome
-log "Welcome to the Sona Linux Installer — Accessible, Debug-Safe, and Friendly."
+# Show system info first
+clear
+echo "=== Welcome to Sona Linux Installer ==="
+echo "System Information:"
+if command -v neofetch &>/dev/null; then
+  neofetch
+else
+  uname -a
+  echo
+  lsblk -o NAME,SIZE,TYPE,MOUNTPOINT
+fi
+echo
 
-# Internet check
-log "Checking for internet..."
+# Ensure network is up
 if ! ping -c 1 archlinux.org &>/dev/null; then
-  echo "No internet. Please connect using iwctl before proceeding."
+  echo "No internet detected. Please connect using 'iwctl' or 'nmtui'."
   exit 1
 fi
 
-# User Info
+# Collect user input
 read -rp "Full name: " FULLNAME
 read -rp "Username (lowercase): " USERNAME
 USERNAME=${USERNAME,,}
@@ -24,29 +33,29 @@ while true; do
   read -rsp "Password: " PASSWORD; echo
   read -rsp "Confirm password: " CONFIRM; echo
   [[ "$PASSWORD" == "$CONFIRM" ]] && break
-  echo "❌ Passwords do not match. Try again."
+  echo "Passwords do not match. Try again."
 done
 
 # Time zone
-echo "Choose your time zone:"
-select T in UTC America/New_York America/Chicago America/Denver America/Los_Angeles Manual; do
-  [[ "$T" == "Manual" ]] && read -rp "Enter time zone (e.g. Europe/London): " TIMEZONE && break
+echo "Choose a time zone:"
+select T in UTC America/New_York America/Chicago America/Denver America/Los_Angeles Europe/London Manual; do
+  [[ "$T" == "Manual" ]] && read -rp "Enter full time zone (e.g. Europe/Berlin): " TIMEZONE && break
   TIMEZONE=$T && break
 done
 
 # Disk selection
 lsblk -d -e 7,11 -o NAME,SIZE,MODEL | nl
-read -rp "Select disk number to install to: " DISK_NUM
+read -rp "Disk number to install to: " DISK_NUM
 DISK_NAME=$(lsblk -d -e 7,11 -o NAME | sed -n "${DISK_NUM}p")
 DISK="/dev/$DISK_NAME"
 
-read -rp "Dual boot with Windows or another OS? (y/N): " DUALBOOT
+read -rp "Dual boot with another OS? (y/N): " DUALBOOT
 DUALBOOT=${DUALBOOT,,}
+
 if [[ "$DUALBOOT" == "y" ]]; then
   lsblk -f
   read -rp "EFI partition (e.g., /dev/sda1): " EFI_PART
   read -rp "Root partition (e.g., /dev/sda5): " ROOT_PART
-  echo "EFI=$EFI_PART | ROOT=$ROOT_PART"
   read -rp "Proceed and format ROOT only? (y/N): " confirm
   [[ "$confirm" =~ ^[Yy]$ ]] || exit 1
   mkfs.ext4 "$ROOT_PART"
@@ -54,9 +63,9 @@ if [[ "$DUALBOOT" == "y" ]]; then
   mkdir -p /mnt/boot
   mount "$EFI_PART" /mnt/boot
 else
-  echo "⚠️ WARNING: ALL data on $DISK will be erased!"
-  read -rp "Are you sure? (y/N): " confirm
-  [[ "$confirm" =~ ^[Yy]$ ]] || exit 1
+  echo "⚠️ ALL DATA ON $DISK WILL BE ERASED!"
+  read -rp "Continue? (yes/N): " confirm
+  [[ "$confirm" == "yes" ]] || exit 1
   parted --script "$DISK" \
     mklabel gpt \
     mkpart primary fat32 1MiB 513MiB \
@@ -69,34 +78,29 @@ else
   mount "${DISK}p1" /mnt/boot
 fi
 
-# Desktop
-echo "Choose a desktop:"
-select D in mate xfce gnome; do DE=$D; break; done
+# Desktop choice
+echo "Choose a desktop environment:"
+select DE in mate xfce gnome; do break; done
 
 read -rp "Enable autologin? (y/N): " AUTOLOGIN
 read -rp "Enable Bluetooth? (y/N): " ENABLE_BT
-read -rp "Install Flatpak? (y/N): " ENABLE_FLATPAK
-read -rp "Install VirtualBox tools? (y/N): " INSTALL_VBOX
+read -rp "Enable Flatpak? (y/N): " ENABLE_FLATPAK
+read -rp "Install VirtualBox host tools? (y/N): " INSTALL_VBOX
 
-# Confirm
-log "SUMMARY"
-echo "User: $USERNAME"
-echo "Host: $HOSTNAME"
-echo "Disk: $DISK"
-echo "Desktop: $DE"
-echo "Timezone: $TIMEZONE"
-[[ "$DUALBOOT" == "y" ]] && echo "Dual Boot: Yes (EFI=$EFI_PART, ROOT=$ROOT_PART)"
-read -rp "Continue? (y/N): " confirm
-[[ "$confirm" =~ ^[Yy]$ ]] || exit 1
+# Essentials modules
+read -rp "Install Developer Tools (Python, Rust, Node, Java, Go)? (y/N): " INSTALL_DEV
+read -rp "Install Accessibility Extras (NVDA, festival, speech tools)? (y/N): " INSTALL_ACC
+read -rp "Install Android/Waydroid + TalkBack? (y/N): " INSTALL_ANDROID
+read -rp "Install Security Tools (Wireshark, metasploit, hashcat)? (y/N): " INSTALL_SEC
+read -rp "Install Shells, Editors, and Power Tools? (y/N): " INSTALL_POWER
 
-# Install base system
-log "Installing Arch base..."
-pacstrap /mnt base linux linux-firmware sudo networkmanager grub efibootmgr os-prober xdg-user-dirs xdg-utils espeakup || error_exit "pacstrap failed"
+# Base install
+log "Installing base system..."
+pacstrap /mnt base linux linux-firmware sudo networkmanager grub efibootmgr os-prober xdg-user-dirs xdg-utils espeakup neofetch
 
 genfstab -U /mnt >> /mnt/etc/fstab
 
-# Chroot configuration
-log "Entering chroot to configure system..."
+# Configure system inside chroot
 arch-chroot /mnt /bin/bash <<EOF
 set -euo pipefail
 
@@ -107,34 +111,30 @@ locale-gen
 echo "LANG=en_US.UTF-8" > /etc/locale.conf
 echo "$HOSTNAME" > /etc/hostname
 
-# User accounts
 echo "root:$PASSWORD" | chpasswd
 useradd -m -c "$FULLNAME" -G wheel,audio,video,storage $USERNAME
 echo "$USERNAME:$PASSWORD" | chpasswd
 echo "%wheel ALL=(ALL) ALL" >> /etc/sudoers
 
-# Enable services
-[[ -f /usr/lib/systemd/system/NetworkManager.service ]] && systemctl enable NetworkManager
-[[ -f /usr/lib/systemd/system/speech-dispatcher.service ]] && systemctl enable speech-dispatcher
-[[ -f /usr/lib/systemd/system/espeakup.service ]] && systemctl enable espeakup
+systemctl enable NetworkManager
+systemctl enable speech-dispatcher
+systemctl enable espeakup
 systemctl enable systemd-timesyncd
 
-# Audio and accessibility
-pacman -Sy --noconfirm xorg xorg-xinit orca espeak brltty gnome-terminal pipewire pipewire-pulse pipewire-alsa pipewire-jack wireplumber
+pacman -Syu --noconfirm xorg xorg-xinit orca espeak-ng brltty gnome-terminal pipewire pipewire-pulse pipewire-alsa pipewire-jack wireplumber alsa-utils synaptic
 
 if [[ "$DE" == "mate" ]]; then
-  pacman -S --noconfirm mate mate-extra lightdm lightdm-gtk-greeter pamac-gtk network-manager-applet
+  pacman -S --noconfirm mate mate-extra lightdm lightdm-gtk-greeter network-manager-applet
   systemctl enable lightdm
 elif [[ "$DE" == "xfce" ]]; then
-  pacman -S --noconfirm xfce4 xfce4-goodies lightdm lightdm-gtk-greeter pamac-gtk network-manager-applet
+  pacman -S --noconfirm xfce4 xfce4-goodies lightdm lightdm-gtk-greeter network-manager-applet
   systemctl enable lightdm
 elif [[ "$DE" == "gnome" ]]; then
-  pacman -S --noconfirm gnome gdm pamac-gtk
+  pacman -S --noconfirm gnome gdm
   echo -e "[daemon]\nAutomaticLoginEnable=true\nAutomaticLogin=$USERNAME\nWaylandEnable=false" > /etc/gdm/custom.conf
   systemctl enable gdm
 fi
 
-# Orca autostart
 mkdir -p /home/$USERNAME/.config/autostart
 cat > /home/$USERNAME/.config/autostart/orca.desktop <<DESKTOP
 [Desktop Entry]
@@ -142,31 +142,26 @@ Type=Application
 Name=Orca
 Exec=orca
 X-GNOME-Autostart-enabled=true
+OnlyShowIn=MATE;GNOME;XFCE;
 DESKTOP
 chown -R $USERNAME:$USERNAME /home/$USERNAME
 
-# Optional tools
+# Optional packages
 [[ "$ENABLE_BT" == "y" ]] && pacman -S --noconfirm bluez bluez-utils && systemctl enable bluetooth
 [[ "$ENABLE_FLATPAK" == "y" ]] && pacman -S --noconfirm flatpak && flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
 [[ "$INSTALL_VBOX" == "y" ]] && pacman -S --noconfirm virtualbox virtualbox-host-modules-arch && usermod -aG vboxusers $USERNAME
 
-# Virtual machine detection
-if systemd-detect-virt | grep -q vmware; then
-  pacman -S --noconfirm open-vm-tools && systemctl enable vmtoolsd
-elif systemd-detect-virt | grep -q oracle; then
-  pacman -S --noconfirm virtualbox-guest-utils && systemctl enable vboxservice
+[[ "$INSTALL_DEV" == "y" ]] && pacman -S --noconfirm base-devel git python python-pip rust nodejs npm go jdk-openjdk
+[[ "$INSTALL_ACC" == "y" ]] && pacman -S --noconfirm wine festival speech-tools speech-dispatcher espeak-ng
+[[ "$INSTALL_ANDROID" == "y" ]] && pacman -S --noconfirm waydroid aosp-uiautomator espeak-ng
+[[ "$INSTALL_SEC" == "y" ]] && pacman -S --noconfirm wireshark-qt hashcat metasploit
+[[ "$INSTALL_POWER" == "y" ]] && pacman -S --noconfirm fish zsh code emacs vim tmux bspwm
+
+# GRUB config
+if ! grep -q "GRUB_DISABLE_OS_PROBER=false" /etc/default/grub; then
+  echo "GRUB_DISABLE_OS_PROBER=false" >> /etc/default/grub
 fi
 
-# Extra apps
-pacman -S --noconfirm firefox libreoffice-fresh thunderbird wget git unzip zip p7zip htop rsync
-
-# LightDM autologin
-if [[ "$AUTOLOGIN" == "y" && "$DE" != "gnome" ]]; then
-  mkdir -p /etc/lightdm/lightdm.conf.d
-  echo -e "[Seat:*]\nautologin-user=$USERNAME\nautologin-session=$DE" > /etc/lightdm/lightdm.conf.d/50-autologin.conf
-fi
-
-# Bootloader
 if [[ -d /sys/firmware/efi ]]; then
   grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
 else
@@ -175,4 +170,4 @@ fi
 grub-mkconfig -o /boot/grub/grub.cfg
 EOF
 
-log "✅ Installation complete! Reboot your system."
+log "Installation complete! Unmount with 'umount -R /mnt' and reboot."
