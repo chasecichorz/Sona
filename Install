@@ -1,0 +1,209 @@
+#!/bin/bash
+set -euo pipefail
+
+echo "Welcome to the Sona Linux Installer — voice-first, Arch-based, and accessible."
+
+# === Check for whiptail ===
+if command -v whiptail >/dev/null 2>&1; then
+  USE_WHIPTAIL=true
+else
+  USE_WHIPTAIL=false
+fi
+
+# === User info ===
+if [ "$USE_WHIPTAIL" = true ]; then
+  FULLNAME=$(whiptail --inputbox "Full name:" 10 60 "" 3>&1 1>&2 2>&3)
+  USERNAME=$(whiptail --inputbox "Username:" 10 60 "sonauser" 3>&1 1>&2 2>&3)
+  HOSTNAME=$(whiptail --inputbox "Hostname:" 10 60 "sona" 3>&1 1>&2 2>&3)
+else
+  read -rp "Full name: " FULLNAME
+  read -rp "Username: " USERNAME
+  read -rp "Hostname: " HOSTNAME
+fi
+USERNAME=${USERNAME,,}
+
+# === Password ===
+while true; do
+  if [ "$USE_WHIPTAIL" = true ]; then
+    PASSWORD=$(whiptail --passwordbox "Enter password:" 10 60 3>&1 1>&2 2>&3)
+    CONFIRM=$(whiptail --passwordbox "Confirm password:" 10 60 3>&1 1>&2 2>&3)
+  else
+    read -rsp "Enter password: " PASSWORD; echo
+    read -rsp "Confirm password: " CONFIRM; echo
+  fi
+  [[ "$PASSWORD" == "$CONFIRM" ]] && break
+  echo "Passwords do not match."
+done
+
+# === Timezone ===
+if [ "$USE_WHIPTAIL" = true ]; then
+  TIMEZONE=$(whiptail --menu "Time zone:" 15 50 6 \
+    "UTC" "Universal Time" \
+    "America/New_York" "Eastern" \
+    "America/Chicago" "Central" \
+    "America/Denver" "Mountain" \
+    "America/Los_Angeles" "Pacific" \
+    "Manual" "Enter manually" 3>&1 1>&2 2>&3)
+  [[ "$TIMEZONE" == "Manual" ]] && TIMEZONE=$(whiptail --inputbox "Enter timezone (e.g., Europe/London):" 10 60 "" 3>&1 1>&2 2>&3)
+else
+  select T in UTC America/New_York America/Chicago America/Denver America/Los_Angeles Manual; do
+    [[ "$T" == "Manual" ]] && read -rp "Timezone: " TIMEZONE && break
+    TIMEZONE=$T && break
+  done
+fi
+
+# === Disk selection ===
+lsblk -d -e 7,11 -o NAME,SIZE,MODEL | nl
+read -rp "Enter disk number to install to: " DISK_NUM
+DISK_NAME=$(lsblk -d -e 7,11 -o NAME | sed -n "${DISK_NUM}p")
+DISK="/dev/$DISK_NAME"
+
+read -rp "Dual-boot with Windows/another OS? (y/N): " DUALBOOT
+DUALBOOT=${DUALBOOT,,}
+if [[ "$DUALBOOT" == "y" ]]; then
+  lsblk -f
+  read -rp "EFI partition (e.g., /dev/sda1): " EFI_PART
+  read -rp "Root partition (e.g., /dev/sda5): " ROOT_PART
+  mkfs.ext4 "$ROOT_PART"
+  mount "$ROOT_PART" /mnt
+  mkdir -p /mnt/boot
+  mount "$EFI_PART" /mnt/boot
+else
+  read -rp "This will erase ALL data on $DISK. Continue? (y/N): " confirm
+  [[ "$confirm" =~ ^[Yy]$ ]] || exit 1
+  parted --script "$DISK" \
+    mklabel gpt \
+    mkpart primary fat32 1MiB 513MiB \
+    set 1 esp on \
+    mkpart primary ext4 513MiB 100%
+  mkfs.fat -F32 "${DISK}p1"
+  mkfs.ext4 -F "${DISK}p2"
+  mount "${DISK}p2" /mnt
+  mkdir -p /mnt/boot
+  mount "${DISK}p1" /mnt/boot
+fi
+
+# === Desktop choice ===
+if [ "$USE_WHIPTAIL" = true ]; then
+  DE=$(whiptail --menu "Desktop:" 15 50 3 \
+    "mate" "MATE" \
+    "xfce" "XFCE" \
+    "gnome" "GNOME" 3>&1 1>&2 2>&3)
+else
+  select D in mate xfce gnome; do DE=$D; break; done
+fi
+
+read -rp "Enable autologin? (y/N): " AUTOLOGIN
+read -rp "Enable Bluetooth? (y/N): " ENABLE_BT
+read -rp "Install Flatpak? (y/N): " ENABLE_FLATPAK
+read -rp "Install VirtualBox tools? (y/N): " INSTALL_VBOX
+
+# === Install base system ===
+pacstrap /mnt base linux linux-firmware sudo networkmanager grub efibootmgr os-prober xdg-user-dirs xdg-utils espeakup
+
+genfstab -U /mnt >> /mnt/etc/fstab
+
+# === Chroot setup ===
+arch-chroot /mnt /bin/bash <<EOF
+set -e
+
+ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime
+hwclock --systohc
+echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
+locale-gen
+echo "LANG=en_US.UTF-8" > /etc/locale.conf
+echo "$HOSTNAME" > /etc/hostname
+
+# Users
+echo "root:$PASSWORD" | chpasswd
+useradd -m -c "$FULLNAME" -G wheel,audio,video,storage $USERNAME
+echo "$USERNAME:$PASSWORD" | chpasswd
+echo "%wheel ALL=(ALL) ALL" >> /etc/sudoers
+
+# Enable core services
+systemctl enable NetworkManager
+systemctl enable speech-dispatcher
+systemctl enable systemd-timesyncd
+systemctl enable espeakup
+
+# Desktop + PipeWire stack
+pacman -Sy --noconfirm xorg xorg-xinit orca espeak brltty gnome-terminal \
+pipewire pipewire-pulse pipewire-alsa pipewire-jack wireplumber
+
+# Desktop packages
+if [[ "$DE" == "mate" ]]; then
+  pacman -S --noconfirm mate mate-extra lightdm lightdm-gtk-greeter pamac-gtk network-manager-applet
+  systemctl enable lightdm
+elif [[ "$DE" == "xfce" ]]; then
+  pacman -S --noconfirm xfce4 xfce4-goodies lightdm lightdm-gtk-greeter pamac-gtk network-manager-applet
+  systemctl enable lightdm
+elif [[ "$DE" == "gnome" ]]; then
+  pacman -S --noconfirm gnome gdm pamac-gtk
+  systemctl enable gdm
+  echo -e "[daemon]\nWaylandEnable=false" > /etc/gdm/custom.conf
+fi
+
+# Orca autostart
+mkdir -p /home/$USERNAME/.config/autostart
+cat > /home/$USERNAME/.config/autostart/orca.desktop <<ORCA
+[Desktop Entry]
+Type=Application
+Name=Orca Screen Reader
+Exec=orca
+X-GNOME-Autostart-enabled=true
+ORCA
+chown -R $USERNAME:$USERNAME /home/$USERNAME
+
+# Optional: Bluetooth
+if [[ "$ENABLE_BT" == "y" ]]; then
+  pacman -S --noconfirm bluez bluez-utils
+  systemctl enable bluetooth
+fi
+
+# Optional: Flatpak
+if [[ "$ENABLE_FLATPAK" == "y" ]]; then
+  pacman -S --noconfirm flatpak
+  flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+fi
+
+# Optional: VirtualBox
+if [[ "$INSTALL_VBOX" == "y" ]]; then
+  pacman -S --noconfirm virtualbox virtualbox-host-modules-arch
+  usermod -aG vboxusers $USERNAME
+fi
+
+# VMware / VBox guest detection
+if systemd-detect-virt | grep -q vmware; then
+  pacman -S --noconfirm open-vm-tools
+  systemctl enable vmtoolsd
+elif systemd-detect-virt | grep -q oracle; then
+  pacman -S --noconfirm virtualbox-guest-utils
+  systemctl enable vboxservice
+fi
+
+# Core apps
+pacman -S --noconfirm firefox libreoffice-fresh thunderbird wget git unzip zip p7zip htop rsync
+
+# Autologin (only for LightDM)
+if [[ "$AUTOLOGIN" == "y" && "$DE" != "gnome" ]]; then
+mkdir -p /etc/lightdm/lightdm.conf.d
+cat > /etc/lightdm/lightdm.conf.d/50-autologin.conf <<LOGIN
+[Seat:*]
+autologin-user=$USERNAME
+autologin-session=$DE
+LOGIN
+fi
+
+# GRUB bootloader
+if [[ -d /sys/firmware/efi ]]; then
+  grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
+else
+  grub-install --target=i386-pc --recheck $DISK
+fi
+grub-mkconfig -o /boot/grub/grub.cfg
+EOF
+
+echo
+echo "Sona Linux installation complete!"
+echo "You may now reboot and enjoy your accessible desktop experience."
+echo "If you land in a console, try: sudo systemctl restart lightdm OR gdm"
