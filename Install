@@ -1,75 +1,110 @@
 #!/bin/bash
 set -euo pipefail
 
-echo "Welcome to the Sona Linux Installer — voice-first, Arch-based, and accessible."
+echo
+echo "Welcome to the Sona Linux Installer — accessible, Arch-based, and beginner-friendly."
+echo
 
-# === Check for whiptail ===
-if command -v whiptail >/dev/null 2>&1; then
-  USE_WHIPTAIL=true
-else
-  USE_WHIPTAIL=false
+# --- Check internet connection ---
+echo "Checking for network connectivity..."
+if ! ping -c 1 archlinux.org &>/dev/null; then
+  echo "No internet connection detected. Please connect before running this script."
+  exit 1
 fi
 
-# === User info ===
-if [ "$USE_WHIPTAIL" = true ]; then
-  FULLNAME=$(whiptail --inputbox "Full name:" 10 60 "" 3>&1 1>&2 2>&3)
-  USERNAME=$(whiptail --inputbox "Username:" 10 60 "sonauser" 3>&1 1>&2 2>&3)
-  HOSTNAME=$(whiptail --inputbox "Hostname:" 10 60 "sona" 3>&1 1>&2 2>&3)
-else
-  read -rp "Full name: " FULLNAME
-  read -rp "Username: " USERNAME
-  read -rp "Hostname: " HOSTNAME
-fi
-USERNAME=${USERNAME,,}
+# --- Wi-Fi setup ---
+read -rp "Are you using Wi-Fi? (y/N): " USE_WIFI
+USE_WIFI=${USE_WIFI,,}
+if [[ "$USE_WIFI" == "y" || "$USE_WIFI" == "yes" ]]; then
+  echo "Starting NetworkManager..."
+  systemctl start NetworkManager
 
-# === Password ===
-while true; do
-  if [ "$USE_WHIPTAIL" = true ]; then
-    PASSWORD=$(whiptail --passwordbox "Enter password:" 10 60 3>&1 1>&2 2>&3)
-    CONFIRM=$(whiptail --passwordbox "Confirm password:" 10 60 3>&1 1>&2 2>&3)
+  echo "Scanning for Wi-Fi networks..."
+  mapfile -t SSIDS < <(nmcli -t -f SSID device wifi list | grep -v '^$' | sort -u)
+
+  if [ "${#SSIDS[@]}" -eq 0 ]; then
+    read -rp "No networks found. Enter hidden SSID manually? (y/N): " HIDDEN_CHOICE
+    HIDDEN_CHOICE=${HIDDEN_CHOICE,,}
+    if [[ "$HIDDEN_CHOICE" != "y" ]]; then
+      echo "No Wi-Fi available. Exiting."
+      exit 1
+    fi
+    read -rp "Enter hidden SSID: " SELECTED_SSID
   else
-    read -rsp "Enter password: " PASSWORD; echo
-    read -rsp "Confirm password: " CONFIRM; echo
+    echo "Available Wi-Fi Networks:"
+    for i in "${!SSIDS[@]}"; do
+      printf "%d) %s\n" "$((i+1))" "${SSIDS[$i]}"
+    done
+    echo "$(( ${#SSIDS[@]} + 1 ))) Enter hidden SSID manually"
+    read -rp "Choose network number: " WIFI_NUM
+
+    if [[ "$WIFI_NUM" -eq $(( ${#SSIDS[@]} + 1 )) ]]; then
+      read -rp "Enter hidden SSID: " SELECTED_SSID
+    else
+      SELECTED_SSID="${SSIDS[$((WIFI_NUM-1))]}"
+    fi
   fi
+
+  echo "Selected SSID: $SELECTED_SSID"
+  read -rsp "Enter password for $SELECTED_SSID: " WIFI_PASS; echo
+
+  echo "Connecting to $SELECTED_SSID..."
+  nmcli device wifi connect "$SELECTED_SSID" password "$WIFI_PASS" || {
+    echo "Wi-Fi connection failed."
+    exit 1
+  }
+
+  echo "Verifying internet access..."
+  if ! ping -c 1 archlinux.org &>/dev/null; then
+    echo "Connection established but internet is unreachable."
+    exit 1
+  fi
+  echo "Connected successfully."
+fi
+
+# --- User input ---
+read -rp "Full name: " FULLNAME
+read -rp "Username (lowercase): " USERNAME
+USERNAME=${USERNAME,,}
+read -rp "Hostname: " HOSTNAME
+
+while true; do
+  read -rsp "Password: " PASSWORD; echo
+  read -rsp "Confirm password: " CONFIRM; echo
   [[ "$PASSWORD" == "$CONFIRM" ]] && break
-  echo "Passwords do not match."
+  echo "Passwords do not match. Try again."
 done
 
-# === Timezone ===
-if [ "$USE_WHIPTAIL" = true ]; then
-  TIMEZONE=$(whiptail --menu "Time zone:" 15 50 6 \
-    "UTC" "Universal Time" \
-    "America/New_York" "Eastern" \
-    "America/Chicago" "Central" \
-    "America/Denver" "Mountain" \
-    "America/Los_Angeles" "Pacific" \
-    "Manual" "Enter manually" 3>&1 1>&2 2>&3)
-  [[ "$TIMEZONE" == "Manual" ]] && TIMEZONE=$(whiptail --inputbox "Enter timezone (e.g., Europe/London):" 10 60 "" 3>&1 1>&2 2>&3)
-else
-  select T in UTC America/New_York America/Chicago America/Denver America/Los_Angeles Manual; do
-    [[ "$T" == "Manual" ]] && read -rp "Timezone: " TIMEZONE && break
-    TIMEZONE=$T && break
-  done
-fi
+# Time zone
+echo "Choose your time zone:"
+select T in UTC America/New_York America/Chicago America/Denver America/Los_Angeles Manual; do
+  [[ "$T" == "Manual" ]] && read -rp "Enter full time zone (e.g., Europe/London): " TIMEZONE && break
+  TIMEZONE=$T && break
+done
 
-# === Disk selection ===
+# Disk selection
+echo "Available Disks:"
 lsblk -d -e 7,11 -o NAME,SIZE,MODEL | nl
 read -rp "Enter disk number to install to: " DISK_NUM
 DISK_NAME=$(lsblk -d -e 7,11 -o NAME | sed -n "${DISK_NUM}p")
 DISK="/dev/$DISK_NAME"
 
-read -rp "Dual-boot with Windows/another OS? (y/N): " DUALBOOT
+read -rp "Dual-boot with Windows or another OS? (y/N): " DUALBOOT
 DUALBOOT=${DUALBOOT,,}
 if [[ "$DUALBOOT" == "y" ]]; then
   lsblk -f
   read -rp "EFI partition (e.g., /dev/sda1): " EFI_PART
-  read -rp "Root partition (e.g., /dev/sda5): " ROOT_PART
+  read -rp "Root (/) partition (e.g., /dev/sda5): " ROOT_PART
+  echo "EFI: $EFI_PART | ROOT: $ROOT_PART"
+  read -rp "Proceed and format ROOT only? (y/N): " confirm
+  [[ "$confirm" =~ ^[Yy]$ ]] || exit 1
   mkfs.ext4 "$ROOT_PART"
   mount "$ROOT_PART" /mnt
   mkdir -p /mnt/boot
   mount "$EFI_PART" /mnt/boot
 else
-  read -rp "This will erase ALL data on $DISK. Continue? (y/N): " confirm
+  echo "WARNING: All data on $DISK will be erased!"
+  read -rp "Are you sure? (y/N): " confirm
   [[ "$confirm" =~ ^[Yy]$ ]] || exit 1
   parted --script "$DISK" \
     mklabel gpt \
@@ -83,29 +118,35 @@ else
   mount "${DISK}p1" /mnt/boot
 fi
 
-# === Desktop choice ===
-if [ "$USE_WHIPTAIL" = true ]; then
-  DE=$(whiptail --menu "Desktop:" 15 50 3 \
-    "mate" "MATE" \
-    "xfce" "XFCE" \
-    "gnome" "GNOME" 3>&1 1>&2 2>&3)
-else
-  select D in mate xfce gnome; do DE=$D; break; done
-fi
+# Desktop environment
+echo "Choose a desktop environment:"
+select D in mate xfce gnome; do DE=$D; break; done
 
 read -rp "Enable autologin? (y/N): " AUTOLOGIN
 read -rp "Enable Bluetooth? (y/N): " ENABLE_BT
 read -rp "Install Flatpak? (y/N): " ENABLE_FLATPAK
 read -rp "Install VirtualBox tools? (y/N): " INSTALL_VBOX
 
-# === Install base system ===
+# Summary
+echo
+echo "=== INSTALL SUMMARY ==="
+echo "User: $USERNAME"
+echo "Host: $HOSTNAME"
+echo "Desktop: $DE"
+echo "Time zone: $TIMEZONE"
+echo "Target disk: $DISK"
+[[ "$DUALBOOT" == "y" ]] && echo "Dual boot: EFI=$EFI_PART ROOT=$ROOT_PART"
+read -rp "Proceed with installation? (y/N): " final_confirm
+[[ "$final_confirm" =~ ^[Yy]$ ]] || exit 1
+
+# Base install
 pacstrap /mnt base linux linux-firmware sudo networkmanager grub efibootmgr os-prober xdg-user-dirs xdg-utils espeakup
 
 genfstab -U /mnt >> /mnt/etc/fstab
 
-# === Chroot setup ===
+# Chroot setup
 arch-chroot /mnt /bin/bash <<EOF
-set -e
+set -euo pipefail
 
 ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime
 hwclock --systohc
@@ -114,23 +155,19 @@ locale-gen
 echo "LANG=en_US.UTF-8" > /etc/locale.conf
 echo "$HOSTNAME" > /etc/hostname
 
-# Users
 echo "root:$PASSWORD" | chpasswd
 useradd -m -c "$FULLNAME" -G wheel,audio,video,storage $USERNAME
 echo "$USERNAME:$PASSWORD" | chpasswd
 echo "%wheel ALL=(ALL) ALL" >> /etc/sudoers
 
-# Enable core services
-systemctl enable NetworkManager
-systemctl enable speech-dispatcher
-systemctl enable systemd-timesyncd
+systemctl enable NetworkManager systemctl enable speech-dispatcher
 systemctl enable espeakup
+systemctl enable systemd-timesyncd
 
-# Desktop + PipeWire stack
+# Desktop + Accessibility
 pacman -Sy --noconfirm xorg xorg-xinit orca espeak brltty gnome-terminal \
 pipewire pipewire-pulse pipewire-alsa pipewire-jack wireplumber
 
-# Desktop packages
 if [[ "$DE" == "mate" ]]; then
   pacman -S --noconfirm mate mate-extra lightdm lightdm-gtk-greeter pamac-gtk network-manager-applet
   systemctl enable lightdm
@@ -139,40 +176,24 @@ elif [[ "$DE" == "xfce" ]]; then
   systemctl enable lightdm
 elif [[ "$DE" == "gnome" ]]; then
   pacman -S --noconfirm gnome gdm pamac-gtk
+  echo -e "[daemon]\nAutomaticLoginEnable=true\nAutomaticLogin=$USERNAME\nWaylandEnable=false" > /etc/gdm/custom.conf
   systemctl enable gdm
-  echo -e "[daemon]\nWaylandEnable=false" > /etc/gdm/custom.conf
 fi
 
-# Orca autostart
 mkdir -p /home/$USERNAME/.config/autostart
-cat > /home/$USERNAME/.config/autostart/orca.desktop <<ORCA
+cat > /home/$USERNAME/.config/autostart/orca.desktop <<AUTOSTART
 [Desktop Entry]
 Type=Application
-Name=Orca Screen Reader
-Exec=orca
-X-GNOME-Autostart-enabled=true
-ORCA
+Name=Orca
+Exec=orca X-GNOME-Autostart-enabled=true
+AUTOSTART
 chown -R $USERNAME:$USERNAME /home/$USERNAME
 
-# Optional: Bluetooth
-if [[ "$ENABLE_BT" == "y" ]]; then
-  pacman -S --noconfirm bluez bluez-utils
-  systemctl enable bluetooth
-fi
+[[ "$ENABLE_BT" == "y" ]] && pacman -S --noconfirm bluez bluez-utils && systemctl enable bluetooth
+[[ "$ENABLE_FLATPAK" == "y" ]] && pacman -S --noconfirm flatpak && flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+[[ "$INSTALL_VBOX" == "y" ]] && pacman -S --noconfirm virtualbox virtualbox-host-modules-arch && usermod -aG vboxusers $USERNAME
 
-# Optional: Flatpak
-if [[ "$ENABLE_FLATPAK" == "y" ]]; then
-  pacman -S --noconfirm flatpak
-  flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
-fi
-
-# Optional: VirtualBox
-if [[ "$INSTALL_VBOX" == "y" ]]; then
-  pacman -S --noconfirm virtualbox virtualbox-host-modules-arch
-  usermod -aG vboxusers $USERNAME
-fi
-
-# VMware / VBox guest detection
+# Virtual machine detection
 if systemd-detect-virt | grep -q vmware; then
   pacman -S --noconfirm open-vm-tools
   systemctl enable vmtoolsd
@@ -181,10 +202,10 @@ elif systemd-detect-virt | grep -q oracle; then
   systemctl enable vboxservice
 fi
 
-# Core apps
+# Default apps
 pacman -S --noconfirm firefox libreoffice-fresh thunderbird wget git unzip zip p7zip htop rsync
 
-# Autologin (only for LightDM)
+# Autologin for LightDM
 if [[ "$AUTOLOGIN" == "y" && "$DE" != "gnome" ]]; then
 mkdir -p /etc/lightdm/lightdm.conf.d
 cat > /etc/lightdm/lightdm.conf.d/50-autologin.conf <<LOGIN
@@ -194,7 +215,7 @@ autologin-session=$DE
 LOGIN
 fi
 
-# GRUB bootloader
+# GRUB install
 if [[ -d /sys/firmware/efi ]]; then
   grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
 else
@@ -204,6 +225,5 @@ grub-mkconfig -o /boot/grub/grub.cfg
 EOF
 
 echo
-echo "Sona Linux installation complete!"
-echo "You may now reboot and enjoy your accessible desktop experience."
-echo "If you land in a console, try: sudo systemctl restart lightdm OR gdm"
+echo "Sona Linux installation is complete!"
+echo "Reboot your system and enjoy."
