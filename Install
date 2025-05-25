@@ -151,6 +151,7 @@ chmod 0440 /etc/sudoers.d/10-sona
 systemctl enable NetworkManager
 systemctl enable speech-dispatcher
 systemctl enable espeakup
+echo speakup_soft >> /etc/modules-load.d/speakup.conf
 systemctl enable systemd-timesyncd
 
 pacman -Syu --noconfirm --needed xorg xorg-xinit orca espeak-ng brltty gnome-terminal pipewire pipewire-pulse pipewire-alsa pipewire-jack wireplumber alsa-utils
@@ -204,4 +205,5 @@ fi
 grub-mkconfig -o /boot/grub/grub.cfg
 EOF
 
-log "✅ Sona Linux installation complete!" echo "Run: umount -R /mnt && reboot"
+log "✅ Sona Linux installation complete!"
+echo "Run: umount -R /mnt && reboot"
