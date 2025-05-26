@@ -1,42 +1,47 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
-log() { echo -e "\n==> $1"; }
-error_exit() { echo "❌ $1"; exit 1; }
-install() { pacman -S --noconfirm "$@"; }
+# ─── Helper functions ───────────────────────────────────────────────────────────
+log() { printf '\n==> %s\n' "$1"; }
+error_exit() { printf '❌ %s\n' "$1"; exit 1; }
+install() { pacman -Sy --noconfirm --needed "$@"; }
 
+# ─── Root check & clear screen ─────────────────────────────────────────────────
+if [[ "$EUID" -ne 0 ]]; then
+  error_exit "Please run as root (or via sudo)."
+fi
 clear
-echo "=== Welcome to Sona Linux Installer ==="
-uname -a
-lsblk -o NAME,SIZE,TYPE,MOUNTPOINT
-echo
+log "Sona Linux Installer starting..."
 
-# Check network
-if ! ping -c 1 archlinux.org &>/dev/null; then
+# ─── Keyring & mirrorlist ───────────────────────────────────────────────────────
+log "Initializing pacman keyring..."
+pacman-key --init
+pacman-key --populate archlinux
+log "Updating mirrorlist..."
+install reflector
+reflector --country 'US' --age 6 --protocol https --sort rate --save /etc/pacman.d/mirrorlist
+log "Mirrorlist refreshed."
+
+# ─── Network check ──────────────────────────────────────────────────────────────
+if ! ping -c1 archlinux.org &>/dev/null; then
   error_exit "No internet detected. Connect using 'iwctl' or 'nmtui'."
 fi
 
-# Optional: optimize mirrors
-read -rp "Optimize pacman mirrors? (y/N): " OPTIMIZE
-OPTIMIZE=${OPTIMIZE,,}
-if [[ "$OPTIMIZE" == "y" ]]; then
-  install reflector
-  reflector --latest 10 --protocol https --sort rate --save /etc/pacman.d/mirrorlist
-  log "Mirrorlist optimized."
-fi
-
-# User info
+# ─── User details ───────────────────────────────────────────────────────────────
 read -rp "Full name: " FULLNAME
 read -rp "Username (lowercase): " USERNAME
 USERNAME=${USERNAME,,}
 read -rp "Hostname: " HOSTNAME
 
+# ─── Password setup ─────────────────────────────────────────────────────────────
 while true; do
   read -rsp "Password: " PASSWORD; echo
   read -rsp "Confirm password: " CONFIRM; echo
   [[ "$PASSWORD" == "$CONFIRM" ]] && break
-  echo "❌ Passwords do not match. Try again."
+  echo "Passwords did not match; try again."
 done
+
+# ─── Locale & keyboard ─────────────────────────────────────────────────────────
 read -rp "Language locale (default: en_US.UTF-8): " LANG_LOCALE
 LANG_LOCALE=${LANG_LOCALE:-en_US.UTF-8}
 read -rp "Console keymap (default: us): " CONSOLE_KEYMAP
@@ -44,94 +49,90 @@ CONSOLE_KEYMAP=${CONSOLE_KEYMAP:-us}
 read -rp "X11 keyboard layout (default: us): " X11_KEYBOARD
 X11_KEYBOARD=${X11_KEYBOARD:-us}
 
-# Time zone
+# ─── Time zone ──────────────────────────────────────────────────────────────────
 echo "Select a time zone:"
-select T in UTC America/New_York America/Chicago America/Denver America/Los_Angeles Europe/London Manual; do
-  [[ "$T" == "Manual" ]] && read -rp "Enter full time zone (e.g. Europe/Berlin): " TIMEZONE && break
-  TIMEZONE=$T && break
+select TZ in UTC America/New_York America/Chicago America/Denver America/Los_Angeles Europe/London Manual; do
+  if [[ "$TZ" == "Manual" ]]; then
+    read -rp "Enter full time zone (e.g. Europe/Berlin): " TIMEZONE
+  else
+    TIMEZONE=$TZ
+  fi
+  break
 done
 
-# Disk selection
+# ─── Disk partitioning ──────────────────────────────────────────────────────────
 lsblk -d -e 7,11 -o NAME,SIZE,MODEL | nl
-DISKS=($(lsblk -d -e 7,11 -o NAME))
+DISKS=( $(lsblk -d -e 7,11 -o NAME) )
 while true; do
-  read -rp "Disk number to install to: " DISK_NUM
-  if [[ "$DISK_NUM" =~ ^[0-9]+$ ]] && [ "$DISK_NUM" -ge 1 ] && [ "$DISK_NUM" -le "${#DISKS[@]}" ]; then
-    DISK_NAME="${DISKS[$((DISK_NUM-1))]}"
-    DISK="/dev/$DISK_NAME"
+  read -rp "Disk number to install to (1-${#DISKS[@]}): " DN
+  if [[ "$DN" =~ ^[0-9]+$ ]] && (( DN >= 1 && DN <= ${#DISKS[@]} )); then
+    DISK="/dev/${DISKS[$((DN-1))]}"
     log "Selected disk: $DISK"
     break
-  else
-    echo "Invalid input. Try again."
   fi
-done read -rp "Dual boot with another OS? (y/N): " DUALBOOT
+  echo "Invalid selection; try again."
+done
+
+read -rp "Dual-boot with another OS? (y/N): " DUALBOOT
 DUALBOOT=${DUALBOOT,,}
 
 if [[ "$DUALBOOT" == "y" ]]; then
   lsblk -f
-  read -rp "EFI partition (e.g., /dev/sda1): " EFI_PART
-  read -rp "Root partition (e.g., /dev/sda5): " ROOT_PART
-  read -rp "Proceed and format root only? (y/N): " CONFIRM
-  [[ "$CONFIRM" =~ ^[Yy]$ ]] || exit 1
+  read -rp "EFI partition (e.g. /dev/sda1): " EFI_PART
+  read -rp "Root partition (e.g. /dev/sda5): " ROOT_PART
+  read -rp "Format root partition only? (y/N): " CF
+  [[ "$CF" =~ ^[Yy]$ ]] || exit 1
   mkfs.ext4 "$ROOT_PART"
   mount "$ROOT_PART" /mnt
   mkdir -p /mnt/boot
   mount "$EFI_PART" /mnt/boot
 else
-  echo "⚠️  ALL data on $DISK will be erased!"
-  read -rp "Type YES to continue: " CONFIRM
-  [[ "$CONFIRM" == "YES" ]] || exit 1
-
-  parted --script "$DISK" \
-    mklabel gpt \
-    mkpart primary fat32 1MiB 513MiB \
-    set 1 esp on \
-    mkpart primary ext4 513MiB 100%
-
-  if [[ "$DISK_NAME" =~ nvme ]]; then
-    EFI_PART="${DISK}p1"
-    ROOT_PART="${DISK}p2"
+  echo "⚠️  ALL DATA ON $DISK WILL BE ERASED!"
+  read -rp "Type YES to continue: " CF
+  [[ "$CF" == "YES" ]] || exit 1
+  parted --script "$DISK"     mklabel gpt     mkpart primary fat32 1MiB 513MiB     set 1 esp on     mkpart primary ext4 513MiB 100% || error_exit "Partitioning failed"
+  if [[ "$DISK" =~ nvme ]]; then
+    EFI_PART="${DISK}p1"; ROOT_PART="${DISK}p2"
   else
-    EFI_PART="${DISK}1"
-    ROOT_PART="${DISK}2"
+    EFI_PART="${DISK}1"; ROOT_PART="${DISK}2"
   fi
-
   mkfs.fat -F32 "$EFI_PART"
   mkfs.ext4 -F "$ROOT_PART"
   mount "$ROOT_PART" /mnt
   mkdir -p /mnt/boot
   mount "$EFI_PART" /mnt/boot
-fi # Desktop choice
+fi
+
+# ─── Desktop & extras ────────────────────────────────────────────────────────────
 echo "Choose a desktop environment:"
 select DE in mate xfce gnome; do break; done
-
-# Optional features
 read -rp "Enable autologin? (y/N): " AUTOLOGIN
 read -rp "Enable Bluetooth? (y/N): " ENABLE_BT
-read -rp "Enable Flatpak? (y/N): " ENABLE_FLATPAK
-read -rp "Install Developer Tools? (y/N): " INSTALL_DEV
+read -rp "Enable Flatpak? (y/N): " INSTALL_FLATPAK
+read -rp "Install Dev Tools? (y/N): " INSTALL_DEV
 read -rp "Install Accessibility Extras? (y/N): " INSTALL_ACC
-read -rp "Install Waydroid / Android support? (y/N): " INSTALL_ANDROID
+read -rp "Install Android/Waydroid? (y/N): " INSTALL_ANDROID
 
-# Base install
+# ─── Base install & fstab ───────────────────────────────────────────────────────
 log "Installing base system..."
 pacstrap /mnt base linux linux-firmware sudo networkmanager grub efibootmgr os-prober espeakup xdg-user-dirs xdg-utils
-
 genfstab -U /mnt >> /mnt/etc/fstab
 
-# Chroot config
-log "Entering chroot..."
+# ─── System configuration in chroot ─────────────────────────────────────────────
+log "Configuring system in chroot..."
 arch-chroot /mnt /bin/bash <<EOF
 set -euo pipefail
+log() { printf "   → %s\n" "\$1"; }
 
+# Time, locale, host
 ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime
 hwclock --systohc
-echo "$LANG_LOCALE UTF-8" >> /etc/locale.gen
-locale-gen
+echo "$LANG_LOCALE UTF-8" >> /etc/locale.gen; locale-gen
 echo "LANG=$LANG_LOCALE" > /etc/locale.conf
 echo "$HOSTNAME" > /etc/hostname
 echo "KEYMAP=$CONSOLE_KEYMAP" > /etc/vconsole.conf
 
+# Keyboard
 mkdir -p /etc/X11/xorg.conf.d
 cat > /etc/X11/xorg.conf.d/00-keyboard.conf <<XKB
 Section "InputClass"
@@ -141,41 +142,77 @@ Section "InputClass"
 EndSection
 XKB
 
+# Users & permissions
 echo "root:$PASSWORD" | chpasswd
-useradd -m -c "$FULLNAME" -G wheel,audio,video,storage $USERNAME
+useradd -m --shell /bin/bash -c "$FULLNAME" -G wheel,audio,video,storage $USERNAME
 echo "$USERNAME:$PASSWORD" | chpasswd
+echo "%wheel ALL=(ALL:ALL) ALL" > /etc/sudoers.d/10-sona; chmod 0440 /etc/sudoers.d/10-sona
 
-echo "%wheel ALL=(ALL:ALL) ALL" > /etc/sudoers.d/10-sona
-chmod 0440 /etc/sudoers.d/10-sona
+# Services & modules
+systemctl enable NetworkManager speech-dispatcher espeakup systemd-timesyncd
+echo speakup_soft > /etc/modules-load.d/speakup.conf
 
-systemctl enable NetworkManager
-systemctl enable speech-dispatcher
-systemctl enable espeakup
-echo speakup_soft >> /etc/modules-load.d/speakup.conf
-systemctl enable systemd-timesyncd
+# CPU microcode
+vendor=\$(lscpu | awk '/Vendor ID/ {print \$3}')
+if [[ "\$vendor" == "GenuineIntel" ]]; then install intel-ucode; elif [[ "\$vendor" == "AuthenticAMD" ]]; then install amd-ucode; fi
 
-pacman -Syu --noconfirm --needed xorg xorg-xinit orca espeak-ng brltty gnome-terminal pipewire pipewire-pulse pipewire-alsa pipewire-jack wireplumber alsa-utils
+# Graphics & audio stack
+install mesa xorg xorg-xinit orca espeak-ng brltty gnome-terminal pipewire pipewire-pulse pipewire-alsa pipewire-jack wireplumber alsa-utils
 
+# Hardware detection: GPU
+GPU=\$(lspci | grep -i VGA || true)
+if echo "\$GPU" | grep -qi nvidia; then
+  install nvidia nvidia-utils nvidia-settings
+  sed -i 's/^MODULES=.*/MODULES=(nvidia nvidia_modeset nvidia_uvm nvidia_drm)/' /etc/mkinitcpio.conf
+  mkinitcpio -P
+elif echo "\$GPU" | grep -Ei 'AMD|ATI'; then
+  install xf86-video-amdgpu
+elif echo "\$GPU" | grep -qi intel; then
+  install xf86-video-intel
+fi
+
+# Hardware detection: Network
+NET=\$(lspci | grep -i network || true)
+if echo "\$NET" | grep -qi broadcom; then install broadcom-wl; fi
+
+# Virtualization
+if grep -qi microsoft /sys/class/dmi/id/sys_vendor 2>/dev/null; then install hyperv-guest-utils; fi
+
+# Desktop environment
 if [[ "$DE" == "mate" ]]; then
-  pacman -S --noconfirm --needed mate mate-extra lightdm lightdm-gtk-greeter network-manager-applet
+  install mate mate-extra lightdm lightdm-gtk-greeter network-manager-applet
   systemctl enable lightdm
   if [[ "$AUTOLOGIN" == "y" ]]; then
     mkdir -p /etc/lightdm/lightdm.conf.d
-    echo -e "[Seat:*]\nautologin-user=$USERNAME\nautologin-session=mate" > /etc/lightdm/lightdm.conf.d/50-autologin.conf
+    cat > /etc/lightdm/lightdm.conf.d/50-autologin.conf <<AUTOSTART
+[Seat:*]
+autologin-user=$USERNAME
+autologin-session=mate
+AUTOSTART
   fi
 elif [[ "$DE" == "xfce" ]]; then
-  pacman -S --noconfirm --needed xfce4 xfce4-goodies lightdm lightdm-gtk-greeter network-manager-applet
+  install xfce4 xfce4-goodies lightdm lightdm-gtk-greeter network-manager-applet
   systemctl enable lightdm
   if [[ "$AUTOLOGIN" == "y" ]]; then
     mkdir -p /etc/lightdm/lightdm.conf.d
-    echo -e "[Seat:*]\nautologin-user=$USERNAME\nautologin-session=xfce" > /etc/lightdm/lightdm.conf.d/50-autologin.conf
+    cat > /etc/lightdm/lightdm.conf.d/50-autologin.conf <<AUTOSTART
+[Seat:*]
+autologin-user=$USERNAME
+autologin-session=xfce
+AUTOSTART
   fi
 elif [[ "$DE" == "gnome" ]]; then
-  pacman -S --noconfirm --needed gnome gdm
-  echo -e "[daemon]\nAutomaticLoginEnable=true\nAutomaticLogin=$USERNAME\nWaylandEnable=false" > /etc/gdm/custom.conf
+  install gnome gdm
+  cat > /etc/gdm/custom.conf <<GDMCONF
+[daemon]
+AutomaticLoginEnable=true
+AutomaticLogin=$USERNAME
+WaylandEnable=false
+GDMCONF
   systemctl enable gdm
 fi
 
+# Autostart Orca
 mkdir -p /home/$USERNAME/.config/autostart
 cat > /home/$USERNAME/.config/autostart/orca.desktop <<DESKTOP
 [Desktop Entry]
@@ -187,23 +224,26 @@ OnlyShowIn=MATE;GNOME;XFCE;
 DESKTOP
 chown -R $USERNAME:$USERNAME /home/$USERNAME
 
-[[ "$ENABLE_BT" == "y" ]] && pacman -S --noconfirm bluez bluez-utils && systemctl enable bluetooth
-[[ "$ENABLE_FLATPAK" == "y" ]] && pacman -S --noconfirm flatpak && flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
-[[ "$INSTALL_DEV" == "y" ]] && pacman -S --noconfirm base-devel git python python-pip rust nodejs npm go jdk-openjdk
-[[ "$INSTALL_ACC" == "y" ]] && pacman -S --noconfirm wine festival speech-tools speech-dispatcher espeak-ng
-[[ "$INSTALL_ANDROID" == "y" ]] && pacman -S --noconfirm waydroid aosp-uiautomator && echo "Waydroid installed. Run 'sudo waydroid init' after reboot."
+# Optional extras
+[[ "$ENABLE_BT"      == "y" ]] && install bluez bluez-utils && systemctl enable bluetooth
+[[ "$INSTALL_FLATPAK"== "y" ]] && install flatpak && flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+[[ "$INSTALL_DEV"    == "y" ]] && install base-devel git python python-pip rust nodejs npm go jdk-openjdk
+[[ "$INSTALL_ACC"    == "y" ]] && install wine festival speech-tools speech-dispatcher espeak-ng
+[[ "$INSTALL_ANDROID"== "y" ]] && install waydroid aosp-uiautomator && echo "Waydroid installed — run 'sudo waydroid init' after reboot"
 
-if ! grep -q "GRUB_DISABLE_OS_PROBER=false" /etc/default/grub; then
+# GRUB installation
+if ! grep -q "^GRUB_DISABLE_OS_PROBER=false" /etc/default/grub; then
   echo "GRUB_DISABLE_OS_PROBER=false" >> /etc/default/grub
 fi
-
 if [[ -d /sys/firmware/efi ]]; then
   grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
 else
   grub-install --target=i386-pc --recheck $DISK
 fi
 grub-mkconfig -o /boot/grub/grub.cfg
+
 EOF
 
-log "✅ Sona Linux installation complete!"
-echo "Run: umount -R /mnt && reboot"
+log "✅ Installation complete! Run: umount -R /mnt && reboot"
+
+  
