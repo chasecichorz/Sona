@@ -1,0 +1,40 @@
+name: Build and Release SONA ISO
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Arch Linux container
+        uses: docker://archlinux:latest
+
+      - name: Install dependencies
+        run: |
+          pacman -Syu --noconfirm archiso git sudo
+
+      - name: Build ISO
+        run: |
+          chmod +x scripts/debug.sh
+          ./scripts/debug.sh
+
+      - name: Upload ISO as artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: sona-iso
+          path: out/*.iso
+
+      - name: Create GitHub Release and upload ISO
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: sona-$(date +'%Y%m%d')
+          name: "SONA Linux $(date +'%Y-%m-%d')"
+          files: out/*.iso
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
