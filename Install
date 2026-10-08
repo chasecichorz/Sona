@@ -1,140 +1,460 @@
-#!/usr/bin/env bash
+#!/bin/bash
+# Sona Linux Installer
+# Accessible Arch Linux + MATE + XLibre with Debian-style TUI
+
 set -euo pipefail
 
-# ─── Helper functions ───────────────────────────────────────────────────────────
-log() { printf '\n==> %s\n' "$1"; }
-error_exit() { printf '❌ %s\n' "$1"; exit 1; }
-install() { pacman -Sy --noconfirm --needed "$@"; }
+BACKTITLE="Sona Linux Accessible Installer"
+SELECTED_SSID=""
+WIFI_PASS=""
 
-# ─── Root check & clear screen ─────────────────────────────────────────────────
-if [[ "$EUID" -ne 0 ]]; then
-  error_exit "Please run as root (or via sudo)."
+ui_msg() {
+    whiptail --backtitle "$BACKTITLE" --title "$1" --msgbox "$2" 12 70
+}
+
+ui_input() {
+    local title="$1" prompt="$2" default="${3:-}"
+    whiptail --backtitle "$BACKTITLE" --title "$title" --inputbox "$prompt" 10 70 "$default" 3>&1 1>&2 2>&3
+}
+
+ui_pass() {
+    local title="$1" prompt="$2"
+    whiptail --backtitle "$BACKTITLE" --title "$title" --passwordbox "$prompt" 10 70 3>&1 1>&2 2>&3
+}
+
+ui_yesno() {
+    local title="$1" prompt="$2"
+    if whiptail --backtitle "$BACKTITLE" --title "$title" --yesno "$prompt" 10 70; then
+        echo "y"
+    else
+        echo "n"
+    fi
+}
+
+err() {
+    printf "Error: %s\n" "$1" >&2
+    exit 1
+}
+
+# 1. Preflight checks
+if [[ $EUID -ne 0 ]]; then
+    err "This installer must be run as root."
 fi
-clear
-log "Sona Linux Installer starting..."
 
-# ─── Keyring & mirrorlist ───────────────────────────────────────────────────────
-log "Initializing pacman keyring..."
+for cmd in parted pacstrap arch-chroot whiptail; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        err "Required command '$cmd' is missing."
+    fi
+done
+
+umount -R /mnt 2>/dev/null || true
+
+# 2. Network and Dynamic Wi-Fi Setup
+setup_network() {
+    local net_type wifi_iface selected_idx
+    net_type=$(whiptail --backtitle "$BACKTITLE" --title "Network Connection" \
+        --menu "How are you connecting to the internet?" 12 70 2 \
+        "1" "Wi-Fi (Scan and select a wireless network)" \
+        "2" "Ethernet (Plugged in via cable)" 3>&1 1>&2 2>&3)
+
+    if [[ "$net_type" == "1" ]]; then
+        wifi_iface=""
+        for dev in /sys/class/net/*; do
+            if [[ -d "$dev/wireless" ]]; then
+                wifi_iface=$(basename "$dev")
+                break
+            fi
+        done
+
+        if [[ -z "$wifi_iface" ]]; then
+            err "No wireless network card detected."
+        fi
+
+        rfkill unblock wifi 2>/dev/null || true
+        ip link set "$wifi_iface" up 2>/dev/null || true
+
+        while true; do
+            echo "Scanning for Wi-Fi networks on $wifi_iface..."
+            if command -v iwctl >/dev/null 2>&1; then
+                iwctl station "$wifi_iface" scan >/dev/null 2>&1 || true
+                sleep 3
+                mapfile -t SSIDS < <(
+                    iwctl station "$wifi_iface" get-networks |
+                    sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' |
+                    awk 'NR>4 {
+                        sub(/^[[:space:]>*]+/, "");
+                        sub(/[[:space:]]+(psk|open|8021x).*$/, "");
+                        if (length($0) > 0) print $0
+                    }' | awk '!seen[$0]++'
+                )
+            elif command -v nmcli >/dev/null 2>&1; then
+                mapfile -t SSIDS < <(nmcli -t -f SSID dev wifi list --rescan yes | grep -v '^$' | awk '!seen[$0]++')
+            else
+                err "Neither iwctl nor nmcli is available for Wi-Fi scanning."
+            fi
+
+            if [[ ${#SSIDS[@]} -eq 0 ]]; then
+                if [[ $(ui_yesno "No Networks Found" "No Wi-Fi networks were found. Scan again?") == "y" ]]; then
+                    continue
+                else
+                    err "Could not find any Wi-Fi networks."
+                fi
+            fi
+
+            menu_items=()
+            for i in "${!SSIDS[@]}"; do
+                menu_items+=("$((i + 1))" "${SSIDS[$i]}")
+            done
+
+            selected_idx=$(whiptail --backtitle "$BACKTITLE" --title "Select Wi-Fi Network" \
+                --menu "Use Up/Down arrows or press a number to choose your Wi-Fi:" 18 70 10 \
+                "${menu_items[@]}" 3>&1 1>&2 2>&3)
+
+            SELECTED_SSID="${SSIDS[$((selected_idx - 1))]}"
+            WIFI_PASS=$(ui_pass "Wi-Fi Password" "Enter password for $SELECTED_SSID (leave blank if open):")
+
+            echo "Connecting to $SELECTED_SSID..."
+            if command -v iwctl >/dev/null 2>&1; then
+                if [[ -n "$WIFI_PASS" ]]; then
+                    iwctl --passphrase "$WIFI_PASS" station "$wifi_iface" connect "$SELECTED_SSID" || true
+                else
+                    iwctl station "$wifi_iface" connect "$SELECTED_SSID" || true
+                fi
+            else
+                if [[ -n "$WIFI_PASS" ]]; then
+                    nmcli dev wifi connect "$SELECTED_SSID" password "$WIFI_PASS" || true
+                else
+                    nmcli dev wifi connect "$SELECTED_SSID" || true
+                fi
+            fi
+
+            sleep 4
+            if ping -c 1 -W 3 archlinux.org >/dev/null 2>&1 || ping -c 1 -W 3 1.1.1.1 >/dev/null 2>&1; then
+                break
+            fi
+
+            if [[ $(ui_yesno "Connection Failed" "Could not connect to $SELECTED_SSID. Try again?") != "y" ]]; then
+                err "Network setup aborted."
+            fi
+        done
+    fi
+
+    if ! ping -c 1 -W 3 archlinux.org >/dev/null 2>&1 && ! ping -c 1 -W 3 1.1.1.1 >/dev/null 2>&1; then
+        err "No internet connection detected."
+    fi
+}
+
+setup_network
+
+echo "Initializing keyring and selecting fastest mirrors..."
+sed -i 's/^#ParallelDownloads.*/ParallelDownloads = 5/' /etc/pacman.conf
 pacman-key --init
 pacman-key --populate archlinux
-log "Updating mirrorlist..."
-install reflector
-reflector --country 'US' --age 6 --protocol https --sort rate --save /etc/pacman.d/mirrorlist
-log "Mirrorlist refreshed."
+pacman -Sy --noconfirm --needed reflector
+reflector --country US --latest 10 --protocol https --sort rate --save /etc/pacman.d/mirrorlist
 
-# ─── Network check ──────────────────────────────────────────────────────────────
-if ! ping -c1 archlinux.org &>/dev/null; then
-  error_exit "No internet detected. Connect using 'iwctl' or 'nmtui'."
+# 3. User and System Settings
+FULLNAME=$(ui_input "User Setup" "Enter your full name:" "Sona User")
+
+while true; do
+    USERNAME=$(ui_input "User Setup" "Enter a lowercase username (no spaces):" "sona")
+    USERNAME="${USERNAME,,}"
+    if [[ "$USERNAME" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+        break
+    fi
+    ui_msg "Invalid Username" "Username must start with a letter and contain only lowercase letters, numbers, or hyphens."
+done
+
+HOSTNAME=$(ui_input "Computer Name" "Enter a name for this computer (hostname):" "sona-pc")
+
+while true; do
+    PASSWORD=$(ui_pass "Password Setup" "Enter a password for $USERNAME:")
+    PASS_CONFIRM=$(ui_pass "Password Setup" "Confirm your password:")
+    if [[ -n "$PASSWORD" && "$PASSWORD" == "$PASS_CONFIRM" ]]; then
+        break
+    fi
+    ui_msg "Password Mismatch" "Passwords did not match or were blank. Please try again."
+done
+
+AUTOLOGIN=$(ui_yesno "Automatic Login" "Log into the MATE desktop automatically on startup without asking for your password?")
+
+TZ_CHOICE=$(whiptail --backtitle "$BACKTITLE" --title "Time Zone" \
+    --menu "Select your time zone:" 16 70 8 \
+    "1" "America/New_York (Eastern)" \
+    "2" "America/Chicago (Central)" \
+    "3" "America/Denver (Mountain)" \
+    "4" "America/Los_Angeles (Pacific)" \
+    "5" "UTC" \
+    "6" "Europe/London" \
+    "7" "Manual Entry" 3>&1 1>&2 2>&3)
+
+case "$TZ_CHOICE" in
+    1) TIMEZONE="America/New_York" ;;
+    2) TIMEZONE="America/Chicago" ;;
+    3) TIMEZONE="America/Denver" ;;
+    4) TIMEZONE="America/Los_Angeles" ;;
+    5) TIMEZONE="UTC" ;;
+    6) TIMEZONE="Europe/London" ;;
+    7) TIMEZONE=$(ui_input "Time Zone" "Enter full time zone (e.g. America/Chicago):" "America/Chicago") ;;
+esac
+
+LANG_LOCALE=$(ui_input "Language Locale" "Confirm system locale:" "en_US.UTF-8")
+CONSOLE_KEYMAP=$(ui_input "Console Keymap" "Confirm console keyboard layout:" "us")
+X11_KEYBOARD=$(ui_input "Desktop Keyboard" "Confirm desktop keyboard layout:" "us")
+
+# 4. Disk Selection and Partitioning (1 GiB EFI Partition)
+mapfile -t DISK_LINES < <(lsblk -d -n -e 7,11 -o NAME,SIZE,MODEL)
+if [[ ${#DISK_LINES[@]} -eq 0 ]]; then
+    err "No storage drives detected."
 fi
 
-# ─── User details ───────────────────────────────────────────────────────────────
-read -rp "Full name: " FULLNAME
-read -rp "Username (lowercase): " USERNAME
-USERNAME=${USERNAME,,}
-read -rp "Hostname: " HOSTNAME
-
-# ─── Password setup ─────────────────────────────────────────────────────────────
-while true; do
-  read -rsp "Password: " PASSWORD; echo
-  read -rsp "Confirm password: " CONFIRM; echo
-  [[ "$PASSWORD" == "$CONFIRM" ]] && break
-  echo "Passwords did not match; try again."
+disk_menu=()
+DISK_NAMES=()
+for i in "${!DISK_LINES[@]}"; do
+    d_name=$(echo "${DISK_LINES[$i]}" | awk '{print $1}')
+    d_info=$(echo "${DISK_LINES[$i]}" | cut -d' ' -f2-)
+    DISK_NAMES+=("$d_name")
+    disk_menu+=("$((i + 1))" "/dev/$d_name ($d_info)")
 done
 
-# ─── Locale & keyboard ─────────────────────────────────────────────────────────
-read -rp "Language locale (default: en_US.UTF-8): " LANG_LOCALE
-LANG_LOCALE=${LANG_LOCALE:-en_US.UTF-8}
-read -rp "Console keymap (default: us): " CONSOLE_KEYMAP
-CONSOLE_KEYMAP=${CONSOLE_KEYMAP:-us}
-read -rp "X11 keyboard layout (default: us): " X11_KEYBOARD
-X11_KEYBOARD=${X11_KEYBOARD:-us}
+disk_idx=$(whiptail --backtitle "$BACKTITLE" --title "Select Installation Drive" \
+    --menu "Choose the drive to install Sona Linux onto:" 15 70 6 \
+    "${disk_menu[@]}" 3>&1 1>&2 2>&3)
 
-# ─── Time zone ──────────────────────────────────────────────────────────────────
-echo "Select a time zone:"
-select TZ in UTC America/New_York America/Chicago America/Denver America/Los_Angeles Europe/London Manual; do
-  if [[ "$TZ" == "Manual" ]]; then
-    read -rp "Enter full time zone (e.g. Europe/Berlin): " TIMEZONE
-  else
-    TIMEZONE=$TZ
-  fi
-  break
-done
+DISK="/dev/${DISK_NAMES[$((disk_idx - 1))]}"
 
-# ─── Disk partitioning ──────────────────────────────────────────────────────────
-lsblk -d -e 7,11 -o NAME,SIZE,MODEL | nl
-DISKS=( $(lsblk -d -e 7,11 -o NAME) )
-while true; do
-  read -rp "Disk number to install to (1-${#DISKS[@]}): " DN
-  if [[ "$DN" =~ ^[0-9]+$ ]] && (( DN >= 1 && DN <= ${#DISKS[@]} )); then
-    DISK="/dev/${DISKS[$((DN-1))]}"
-    log "Selected disk: $DISK"
-    break
-  fi
-  echo "Invalid selection; try again."
-done
+PART_MODE=$(whiptail --backtitle "$BACKTITLE" --title "Partitioning Method" \
+    --menu "How would you like to partition $DISK?" 12 70 2 \
+    "1" "Erase entire disk and setup Sona Linux automatically" \
+    "2" "Manual dual-boot (use existing partitions)" 3>&1 1>&2 2>&3)
 
-read -rp "Dual-boot with another OS? (y/N): " DUALBOOT
-DUALBOOT=${DUALBOOT,,}
-
-if [[ "$DUALBOOT" == "y" ]]; then
-  lsblk -f
-  read -rp "EFI partition (e.g. /dev/sda1): " EFI_PART
-  read -rp "Root partition (e.g. /dev/sda5): " ROOT_PART
-  read -rp "Format root partition only? (y/N): " CF
-  [[ "$CF" =~ ^[Yy]$ ]] || exit 1
-  mkfs.ext4 "$ROOT_PART"
-  mount "$ROOT_PART" /mnt
-  mkdir -p /mnt/boot
-  mount "$EFI_PART" /mnt/boot
+if [[ "$PART_MODE" == "2" ]]; then
+    EFI_PART=$(ui_input "Dual-Boot Setup" "Enter existing EFI partition path (e.g. /dev/nvme0n1p1):" "")
+    ROOT_PART=$(ui_input "Dual-Boot Setup" "Enter target Linux root partition path (e.g. /dev/nvme0n1p2):" "")
+    if [[ $(ui_yesno "Confirm Format" "Format $ROOT_PART as ext4?") != "y" ]]; then
+        err "Installation cancelled by user."
+    fi
+    mkfs.ext4 -F "$ROOT_PART"
 else
-  echo "⚠️  ALL DATA ON $DISK WILL BE ERASED!"
-  read -rp "Type YES to continue: " CF
-  [[ "$CF" == "YES" ]] || exit 1
-  parted --script "$DISK"     mklabel gpt     mkpart primary fat32 1MiB 513MiB     set 1 esp on     mkpart primary ext4 513MiB 100% || error_exit "Partitioning failed"
-  if [[ "$DISK" =~ nvme ]]; then
-    EFI_PART="${DISK}p1"; ROOT_PART="${DISK}p2"
-  else
-    EFI_PART="${DISK}1"; ROOT_PART="${DISK}2"
-  fi
-  mkfs.fat -F32 "$EFI_PART"
-  mkfs.ext4 -F "$ROOT_PART"
-  mount "$ROOT_PART" /mnt
-  mkdir -p /mnt/boot
-  mount "$EFI_PART" /mnt/boot
+    if [[ $(ui_yesno "Confirm Disk Erase" "WARNING: Everything on $DISK will be permanently erased. Continue?") != "y" ]]; then
+        err "Installation cancelled by user."
+    fi
+
+    parted -s "$DISK" \
+        mklabel gpt \
+        mkpart ESP fat32 1MiB 1025MiB \
+        set 1 esp on \
+        mkpart root ext4 1025MiB 100%
+
+    if [[ "$DISK" =~ (nvme|mmcblk|loop) ]]; then
+        EFI_PART="${DISK}p1"
+        ROOT_PART="${DISK}p2"
+    else
+        EFI_PART="${DISK}1"
+        ROOT_PART="${DISK}2"
+    fi
+
+    mkfs.fat -F 32 "$EFI_PART"
+    mkfs.ext4 -F "$ROOT_PART"
 fi
 
-# ─── Desktop & extras ────────────────────────────────────────────────────────────
-echo "Choose a desktop environment:"
-select DE in mate xfce gnome; do break; done
-read -rp "Enable autologin? (y/N): " AUTOLOGIN
-read -rp "Enable Bluetooth? (y/N): " ENABLE_BT
-read -rp "Enable Flatpak? (y/N): " INSTALL_FLATPAK
-read -rp "Install Dev Tools? (y/N): " INSTALL_DEV
-read -rp "Install Accessibility Extras? (y/N): " INSTALL_ACC
-read -rp "Install Android/Waydroid? (y/N): " INSTALL_ANDROID
+mount "$ROOT_PART" /mnt
+mkdir -p /mnt/boot
+mount "$EFI_PART" /mnt/boot
 
-# ─── Base install & fstab ───────────────────────────────────────────────────────
-log "Installing base system..."
-pacstrap /mnt base linux linux-firmware sudo networkmanager grub efibootmgr os-prober espeakup xdg-user-dirs xdg-utils
-genfstab -U /mnt >> /mnt/etc/fstab
+# 5. Detect CPU Microcode Before Pacstrap
+UCODE_PKG=""
+cpu_vendor=$(awk '/vendor_id/ {print $3; exit}' /proc/cpuinfo)
+if [[ "$cpu_vendor" == "GenuineIntel" ]]; then
+    UCODE_PKG="intel-ucode"
+elif [[ "$cpu_vendor" == "AuthenticAMD" ]]; then
+    UCODE_PKG="amd-ucode"
+fi
 
-# ─── System configuration in chroot ─────────────────────────────────────────────
-log "Configuring system in chroot..."
-arch-chroot /mnt /bin/bash <<EOF
+# 6. Core Base System Pacstrap (Strictly guaranteed core/extra packages)
+echo "Installing Sona Linux core system and audio stack..."
+pacstrap /mnt \
+    base \
+    base-devel \
+    linux \
+    linux-headers \
+    linux-firmware \
+    sof-firmware \
+    alsa-ucm-conf \
+    $UCODE_PKG \
+    sudo \
+    git \
+    curl \
+    wget \
+    nano \
+    zram-generator \
+    pacman-contrib \
+    networkmanager \
+    bluez \
+    bluez-utils \
+    grub \
+    efibootmgr \
+    os-prober \
+    espeakup \
+    espeak-ng \
+    speech-dispatcher \
+    orca \
+    brltty \
+    alsa-utils \
+    pipewire \
+    pipewire-pulse \
+    pipewire-alsa \
+    pipewire-jack \
+    wireplumber \
+    libcanberra \
+    sound-theme-freedesktop \
+    xdg-user-dirs \
+    xdg-utils
+
+# Export active Wi-Fi credentials directly to a native NetworkManager connection profile
+if [[ -n "$SELECTED_SSID" ]]; then
+    mkdir -p /mnt/etc/NetworkManager/system-connections
+    NM_UUID=$(cat /proc/sys/kernel/random/uuid)
+    if [[ -n "$WIFI_PASS" ]]; then
+        cat > "/mnt/etc/NetworkManager/system-connections/${SELECTED_SSID}.nmconnection" <<NMCONF
+[connection]
+id=$SELECTED_SSID
+uuid=$NM_UUID
+type=wifi
+autoconnect=true
+
+[wifi]
+mode=infrastructure
+ssid=$SELECTED_SSID
+
+[wifi-security]
+key-mgmt=wpa-psk
+psk=$WIFI_PASS
+
+[ipv4]
+method=auto
+
+[ipv6]
+method=auto
+NMCONF
+    else
+        cat > "/mnt/etc/NetworkManager/system-connections/${SELECTED_SSID}.nmconnection" <<NMCONF
+[connection]
+id=$SELECTED_SSID
+uuid=$NM_UUID
+type=wifi
+autoconnect=true
+
+[wifi]
+mode=infrastructure
+ssid=$SELECTED_SSID
+
+[ipv4]
+method=auto
+
+[ipv6]
+method=auto
+NMCONF
+    fi
+    chmod 600 "/mnt/etc/NetworkManager/system-connections/${SELECTED_SSID}.nmconnection"
+fi
+
+genfstab -U /mnt > /mnt/etc/fstab
+
+# 7. Pass Configuration into Chroot
+cat > /mnt/root/install.conf <<EOF
+FULLNAME=$(printf '%q' "$FULLNAME")
+USERNAME=$(printf '%q' "$USERNAME")
+PASSWORD=$(printf '%q' "$PASSWORD")
+HOSTNAME=$(printf '%q' "$HOSTNAME")
+TIMEZONE=$(printf '%q' "$TIMEZONE")
+LANG_LOCALE=$(printf '%q' "$LANG_LOCALE")
+CONSOLE_KEYMAP=$(printf '%q' "$CONSOLE_KEYMAP")
+X11_KEYBOARD=$(printf '%q' "$X11_KEYBOARD")
+DISK=$(printf '%q' "$DISK")
+AUTOLOGIN=$(printf '%q' "$AUTOLOGIN")
+EOF
+chmod 600 /mnt/root/install.conf
+
+cat << 'EOF' > /mnt/root/setup-chroot.sh
+#!/bin/bash
 set -euo pipefail
-log() { printf "   → %s\n" "\$1"; }
 
-# Time, locale, host
-ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime
+source /root/install.conf
+
+pac_install() {
+    pacman -Sy --noconfirm --needed "$@"
+}
+
+install_optional() {
+    for pkg in "$@"; do
+        pacman -S --noconfirm --needed "$pkg" || echo "Warning: Optional package $pkg skipped."
+    done
+}
+
+# 1. Timezone, clock, and locale
+ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
 hwclock --systohc
-echo "$LANG_LOCALE UTF-8" >> /etc/locale.gen; locale-gen
+
+echo "$LANG_LOCALE UTF-8" > /etc/locale.gen
+locale-gen
 echo "LANG=$LANG_LOCALE" > /etc/locale.conf
+
 echo "$HOSTNAME" > /etc/hostname
 echo "KEYMAP=$CONSOLE_KEYMAP" > /etc/vconsole.conf
 
-# Keyboard
+# 2. Pacman tuning, multilib (required for Wine), and automatic maintenance timers
+sed -i 's/^#Color/Color/' /etc/pacman.conf
+sed -i 's/^#ParallelDownloads.*/ParallelDownloads = 5/' /etc/pacman.conf
+sed -i '/^#\[multilib\]/,/^#Include = \/etc\/pacman.d\/mirrorlist/ s/^#//' /etc/pacman.conf
+pacman -Sy
+
+systemctl enable archlinux-keyring-wkd-sync.timer
+systemctl enable paccache.timer
+
+# 3. Zram swap configuration
+cat > /etc/systemd/zram-generator.conf << ZRAM
+[zram0]
+zram-size = ram / 2
+compression-algorithm = zstd
+ZRAM
+
+# 4. Global accessibility and default browser environment variables
+cat >> /etc/environment << A11Y_ENV
+GTK_MODULES=gail:atk-bridge
+QT_ACCESSIBILITY=1
+QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1
+ACCESSIBILITY_ENABLED=1
+GNOME_ACCESSIBILITY=1
+BROWSER=google-chrome-stable
+A11Y_ENV
+
+# 5. User accounts and sudoers
+echo "root:$PASSWORD" | chpasswd
+useradd -m -c "$FULLNAME" -G wheel,input,lp,sys -s /bin/bash "$USERNAME"
+echo "$USERNAME:$PASSWORD" | chpasswd
+echo "%wheel ALL=(ALL:ALL) ALL" > /etc/sudoers.d/10-wheel
+chmod 0440 /etc/sudoers.d/10-wheel
+
+# 6. XLibre repository and display server
+curl -fsSLO https://xlibre-arch.github.io/xlibre-archlinux.asc
+pacman-key --add xlibre-archlinux.asc
+pacman-key --finger B97F7C613F359424
+pacman-key --lsign-key B97F7C613F359424
+rm -f xlibre-archlinux.asc
+
+if ! grep -q '^\[xlibre-stable\]' /etc/pacman.conf; then
+    cat >> /etc/pacman.conf << 'REPO'
+
+[xlibre-stable]
+Server = https://packages.xlibre.net/arch/stable/$arch
+REPO
+fi
+
+pacman -Syyu --noconfirm --ask 4 xlibre-meta mesa xorg-xinit
+
 mkdir -p /etc/X11/xorg.conf.d
-cat > /etc/X11/xorg.conf.d/00-keyboard.conf <<XKB
+cat > /etc/X11/xorg.conf.d/00-keyboard.conf << XKB
 Section "InputClass"
     Identifier "system-keyboard"
     MatchIsKeyboard "on"
@@ -142,108 +462,534 @@ Section "InputClass"
 EndSection
 XKB
 
-# Users & permissions
-echo "root:$PASSWORD" | chpasswd
-useradd -m --shell /bin/bash -c "$FULLNAME" -G wheel,audio,video,storage $USERNAME
-echo "$USERNAME:$PASSWORD" | chpasswd
-echo "%wheel ALL=(ALL:ALL) ALL" > /etc/sudoers.d/10-sona; chmod 0440 /etc/sudoers.d/10-sona
-
-# Services & modules
-systemctl enable NetworkManager speech-dispatcher espeakup systemd-timesyncd
-echo speakup_soft > /etc/modules-load.d/speakup.conf
-
-# CPU microcode
-vendor=\$(lscpu | awk '/Vendor ID/ {print \$3}')
-if [[ "\$vendor" == "GenuineIntel" ]]; then install intel-ucode; elif [[ "\$vendor" == "AuthenticAMD" ]]; then install amd-ucode; fi
-
-# Graphics & audio stack
-install mesa xorg xorg-xinit orca espeak-ng brltty gnome-terminal pipewire pipewire-pulse pipewire-alsa pipewire-jack wireplumber alsa-utils
-
-# Hardware detection: GPU
-GPU=\$(lspci | grep -i VGA || true)
-if echo "\$GPU" | grep -qi nvidia; then
-  install nvidia nvidia-utils nvidia-settings
-  sed -i 's/^MODULES=.*/MODULES=(nvidia nvidia_modeset nvidia_uvm nvidia_drm)/' /etc/mkinitcpio.conf
-  mkinitcpio -P
-elif echo "\$GPU" | grep -Ei 'AMD|ATI'; then
-  install xf86-video-amdgpu
-elif echo "\$GPU" | grep -qi intel; then
-  install xf86-video-intel
+# 7. Modern GPU, network, and virtualization driver detection
+gpu_info=$(lspci -nn | grep -Ei 'VGA|3D|Display' || true)
+if echo "$gpu_info" | grep -qi nvidia; then
+    pac_install nvidia-open nvidia-utils nvidia-settings
+    mkdir -p /etc/mkinitcpio.conf.d
+    cat > /etc/mkinitcpio.conf.d/nvidia.conf << NVMODS
+MODULES+=(nvidia nvidia_modeset nvidia_uvm nvidia_drm)
+NVMODS
+    mkinitcpio -P
+    if echo "$gpu_info" | grep -Eqi 'Intel|AMD|ATI'; then
+        pac_install nvidia-prime
+    fi
 fi
 
-# Hardware detection: Network
-NET=\$(lspci | grep -i network || true)
-if echo "\$NET" | grep -qi broadcom; then install broadcom-wl; fi
+net_info=$(lspci | grep -i network || true)
+if echo "$net_info" | grep -qi broadcom; then
+    install_optional dkms broadcom-wl-dkms
+fi
 
-# Virtualization
-if grep -qi microsoft /sys/class/dmi/id/sys_vendor 2>/dev/null; then install hyperv-guest-utils; fi
+if grep -qi microsoft /sys/class/dmi/id/sys_vendor 2>/dev/null; then
+    install_optional hyperv
+    systemctl enable hv_fcopy_daemon.service hv_kvp_daemon.service hv_vss_daemon.service || true
+fi
 
-# Desktop environment
-if [[ "$DE" == "mate" ]]; then
-  install mate mate-extra lightdm lightdm-gtk-greeter network-manager-applet
-  systemctl enable lightdm
-  if [[ "$AUTOLOGIN" == "y" ]]; then
-    mkdir -p /etc/lightdm/lightdm.conf.d
-    cat > /etc/lightdm/lightdm.conf.d/50-autologin.conf <<AUTOSTART
+# 8. MATE desktop, LightDM, and full application suite
+pac_install mate mate-extra lightdm lightdm-gtk-greeter network-manager-applet dconf
+
+install_optional \
+    blueman \
+    flatpak \
+    wine \
+    festival \
+    festival-us \
+    tesseract \
+    tesseract-data-eng \
+    poppler \
+    simple-scan \
+    maim \
+    xdotool \
+    xclip \
+    copyq \
+    pavucontrol \
+    vlc \
+    mpv \
+    ffmpeg \
+    gst-plugins-good \
+    gst-plugins-bad \
+    gst-plugins-ugly \
+    gst-libav \
+    sound-juicer \
+    yt-dlp \
+    libreoffice-fresh \
+    hunspell \
+    hunspell-en_us \
+    thunderbird \
+    ntfs-3g \
+    exfatprogs \
+    gvfs \
+    gvfs-mtp \
+    gvfs-smb \
+    7zip \
+    unzip \
+    unrar \
+    cups \
+    system-config-printer \
+    avahi \
+    nss-mdns \
+    sane \
+    sane-airscan \
+    timeshift \
+    cronie \
+    zenity
+
+# 9. Core services, Printing, Timeshift, Bluetooth, Flathub, and Speech
+systemctl enable \
+    NetworkManager \
+    bluetooth \
+    cups.service \
+    avahi-daemon.service \
+    cronie.service \
+    speech-dispatcher \
+    espeakup \
+    systemd-timesyncd \
+    lightdm
+
+echo "speakup_soft" > /etc/modules-load.d/speakup.conf
+
+if grep -q '^hosts:' /etc/nsswitch.conf && ! grep -q 'mdns_minimal' /etc/nsswitch.conf; then
+    sed -i 's/^hosts: files mymachines/hosts: files mymachines mdns_minimal [NOTFOUND=return]/' /etc/nsswitch.conf
+fi
+
+if [[ -f /etc/bluetooth/main.conf ]]; then
+    sed -i 's/^#*\s*AutoEnable.*/AutoEnable=true/' /etc/bluetooth/main.conf
+fi
+
+if [[ -f /etc/speech-dispatcher/speechd.conf ]]; then
+    sed -i 's/^#*\s*AudioOutputMethod.*/AudioOutputMethod "pulse"/' /etc/speech-dispatcher/speechd.conf
+fi
+
+flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo || true
+
+# 10. QuickMail-style 3-Pane Accessible Layout for Thunderbird
+mkdir -p /usr/lib/thunderbird/defaults/pref
+cat > /usr/lib/thunderbird/defaults/pref/sona-quickmail.js << TBPREF
+// Sona Linux: QuickMail-inspired accessible 3-pane configuration
+pref("mail.pane_config.dynamic", 0);
+pref("mail.threadpane.listview", 1);
+pref("mailnews.start_page.enabled", false);
+pref("spacesToolbar.shown", false);
+pref("mail.tabs.autoHide", true);
+TBPREF
+
+# 11. LightDM Greeter, Audio Handoff, and Shutdown Chime
+cat > /etc/lightdm/lightdm-gtk-greeter.conf << GREETER
+[greeter]
+reader = orca
+a11y-states = +reader
+GREETER
+
+mkdir -p /etc/lightdm/lightdm.conf.d
+cat > /etc/lightdm/lightdm.conf.d/40-audio-handoff.conf << HANDOFF
+[Seat:*]
+session-setup-script=/usr/bin/systemctl stop espeakup.service
+session-cleanup-script=/usr/bin/systemctl start espeakup.service
+HANDOFF
+
+cat > /etc/systemd/system/sona-shutdown-sound.service << SHUTSOUND
+[Unit]
+Description=Sona Linux Shutdown Audio Cue
+DefaultDependencies=no
+Before=shutdown.target reboot.target halt.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/paplay /usr/share/sounds/freedesktop/stereo/service-logout.oga
+
+[Install]
+WantedBy=halt.target reboot.target shutdown.target
+SHUTSOUND
+systemctl enable sona-shutdown-sound.service
+
+if [[ "$AUTOLOGIN" == "y" ]]; then
+    cat > /etc/lightdm/lightdm.conf.d/50-autologin.conf << AUTOCONF
 [Seat:*]
 autologin-user=$USERNAME
 autologin-session=mate
-AUTOSTART
-  fi
-elif [[ "$DE" == "xfce" ]]; then
-  install xfce4 xfce4-goodies lightdm lightdm-gtk-greeter network-manager-applet
-  systemctl enable lightdm
-  if [[ "$AUTOLOGIN" == "y" ]]; then
-    mkdir -p /etc/lightdm/lightdm.conf.d
-    cat > /etc/lightdm/lightdm.conf.d/50-autologin.conf <<AUTOSTART
-[Seat:*]
-autologin-user=$USERNAME
-autologin-session=xfce
-AUTOSTART
-  fi
-elif [[ "$DE" == "gnome" ]]; then
-  install gnome gdm
-  cat > /etc/gdm/custom.conf <<GDMCONF
-[daemon]
-AutomaticLoginEnable=true
-AutomaticLogin=$USERNAME
-WaylandEnable=false
-GDMCONF
-  systemctl enable gdm
+AUTOCONF
 fi
 
-# Autostart Orca
-mkdir -p /home/$USERNAME/.config/autostart
-cat > /home/$USERNAME/.config/autostart/orca.desktop <<DESKTOP
+# 12. System-wide MATE accessibility, Windows 2000 Redmond layout, and keybindings (including Copilot key)
+mkdir -p /etc/dconf/profile /etc/dconf/db/local.d
+cat > /etc/dconf/profile/user << DCONF_PROF
+user-db:user
+system-db:local
+DCONF_PROF
+
+cat > /etc/dconf/db/local.d/00-sona-a11y << DCONF_SETTINGS
+[org/mate/desktop/interface]
+accessibility=true
+
+[org/gnome/desktop/a11y/applications]
+screen-reader-enabled=true
+
+[org/mate/panel/general]
+default-layout='redmond'
+
+[org/mate/desktop/sound]
+event-sounds=true
+input-feedback-sounds=true
+theme-name='freedesktop'
+
+[org/mate/caja/desktop]
+computer-icon-visible=true
+home-icon-visible=true
+trash-icon-visible=true
+volumes-visible=true
+network-icon-visible=false
+
+[org/mate/caja/preferences]
+default-folder-viewer='list-view'
+sort-directories-first=true
+
+[org/mate/marco/global-keybindings]
+panel-main-menu='Super_L'
+run-command-1='<Alt><Mod4>s'
+run-command-2='<Alt><Mod4>h'
+run-command-3='<Alt><Mod4>o'
+run-command-4='<Mod4>v'
+run-command-5='<Shift><Mod4>F23'
+run-command-6='<Shift><Mod4>XF86TouchpadOff'
+
+[org/mate/marco/keybinding-commands]
+command-1='orca --replace'
+command-2='mate-terminal --title="Sona AI Assistant" -e /usr/local/bin/sona-ai'
+command-3='/usr/local/bin/sona-ocr'
+command-4='copyq toggle'
+command-5='mate-terminal --title="Sona AI Assistant" -e /usr/local/bin/sona-ai'
+command-6='mate-terminal --title="Sona AI Assistant" -e /usr/local/bin/sona-ai'
+DCONF_SETTINGS
+
+dconf update
+
+# 13. Install yay and AUR packages (Chrome, Pamac, Thorium, RHVoice, OCR tools)
+echo "%wheel ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/99-temp-nopasswd
+su - "$USERNAME" -c "git clone https://aur.archlinux.org/yay-bin.git /tmp/yay-bin && cd /tmp/yay-bin && makepkg -si --noconfirm"
+rm -rf /tmp/yay-bin
+
+for aur_pkg in google-chrome tgpt-bin pamac-aur thorium-reader-bin ocrmypdf lios-git abcde rhvoice; do
+    su - "$USERNAME" -c "yay -S --noconfirm $aur_pkg" || echo "Warning: AUR package $aur_pkg skipped."
+done
+rm -f /etc/sudoers.d/99-temp-nopasswd
+
+# 14. Built-in Sona AI Assistant (Alt+Super+H / Copilot Key)
+cat > /usr/local/bin/sona-ai << 'SONA_AI_SCRIPT'
+#!/bin/bash
+echo "====================================================="
+echo " Welcome to the Sona Linux AI Assistant"
+echo " Type any question about Sona Linux, MATE, or Orca."
+echo " Type 'exit' or press Ctrl+C to close."
+echo "====================================================="
+
+SYS_PROMPT="You are the built-in helper for Sona Linux, an accessible Arch Linux distribution for blind users running the MATE desktop (configured in the Windows 2000 Redmond layout), XLibre, and the Orca screen reader. Pressing the Windows (Super) key or Alt+F1 opens the classic vertical Start menu. All main apps are also right on the Desktop (Alt+Ctrl+D): Google Chrome, Thunderbird Email (3-pane QuickMail layout using F6/Shift+F6), Add or Remove Software (Pamac), Word Processor (LibreOffice), Thorium Book Reader, VLC Media Player, Instant Screen OCR (Alt+Super+O), Clipboard History (Super+V), and System Restore (Timeshift). Keep answers concise, plain-text, and focused on keyboard shortcuts."
+
+while true; do
+    printf "\nAsk Sona: "
+    read -r user_query
+    if [[ -z "$user_query" ]]; then
+        continue
+    fi
+    if [[ "${user_query,,}" == "exit" || "${user_query,,}" == "quit" ]]; then
+        break
+    fi
+    echo "Thinking..."
+    tgpt -q --preprompt "$SYS_PROMPT" "$user_query" 2>/dev/null || echo "Unable to reach AI service. Check your internet connection."
+done
+SONA_AI_SCRIPT
+chmod +x /usr/local/bin/sona-ai
+
+cat > /usr/share/applications/sona-ai.desktop << SONA_AI_DESKTOP
+[Desktop Entry]
+Type=Application
+Name=Sona AI Assistant
+Comment=Ask questions and get help using Sona Linux
+Exec=mate-terminal --title="Sona AI Assistant" -e /usr/local/bin/sona-ai
+Icon=utilities-terminal
+Terminal=false
+Categories=Utility;Accessibility;
+SONA_AI_DESKTOP
+
+# 15. NVDA-Style Instant Window OCR Tool (Alt+Super+O)
+cat > /usr/local/bin/sona-ocr << 'SONA_OCR_SCRIPT'
+#!/bin/bash
+spd-say "Recognizing window, please wait" 2>/dev/null || true
+TMP_IMG=$(mktemp /tmp/sona-ocr-XXXXXX.png)
+TMP_TXT=$(mktemp /tmp/sona-ocr-XXXXXX.txt)
+
+ACTIVE_WIN=$(xdotool getactivewindow 2>/dev/null || true)
+if [[ -n "$ACTIVE_WIN" ]]; then
+    maim --window "$ACTIVE_WIN" "$TMP_IMG" 2>/dev/null || maim "$TMP_IMG"
+else
+    maim "$TMP_IMG"
+fi
+
+tesseract "$TMP_IMG" stdout -l eng 2>/dev/null > "$TMP_TXT" || true
+
+if [[ -s "$TMP_TXT" ]]; then
+    xclip -selection clipboard < "$TMP_TXT" 2>/dev/null || true
+    zenity --text-info --title="Sona Instant OCR (Copied to Clipboard - Press Escape to Close)" --width=700 --height=500 --filename="$TMP_TXT" 2>/dev/null || true
+else
+    spd-say "No text recognized in the current window" 2>/dev/null || true
+    zenity --info --title="Sona Instant OCR" --text="No readable text was detected in the current window." 2>/dev/null || true
+fi
+
+rm -f "$TMP_IMG" "$TMP_TXT"
+SONA_OCR_SCRIPT
+chmod +x /usr/local/bin/sona-ocr
+
+cat > /usr/share/applications/sona-ocr.desktop << SONA_OCR_DESKTOP
+[Desktop Entry]
+Type=Application
+Name=Instant Screen OCR
+Comment=Recognize text in the active window and read it with Orca
+Exec=/usr/local/bin/sona-ocr
+Icon=scanner
+Terminal=false
+Categories=Utility;Accessibility;
+SONA_OCR_DESKTOP
+
+# 16. Populate Desktop Icons for User and /etc/skel (Ready for Live ISO too)
+create_desktop_shortcuts() {
+    local target_dir="$1"
+    mkdir -p "$target_dir"
+
+    cat > "$target_dir/Google Chrome.desktop" << 'EOF_ICON'
+[Desktop Entry]
+Type=Application
+Name=Google Chrome
+Comment=Browse the web
+Exec=google-chrome-stable %U
+Icon=google-chrome
+Terminal=false
+EOF_ICON
+
+    cat > "$target_dir/Thunderbird Email.desktop" << 'EOF_ICON'
+[Desktop Entry]
+Type=Application
+Name=Thunderbird Email
+Comment=Read and send email
+Exec=thunderbird %u
+Icon=thunderbird
+Terminal=false
+EOF_ICON
+
+    cat > "$target_dir/Add or Remove Software.desktop" << 'EOF_ICON'
+[Desktop Entry]
+Type=Application
+Name=Add or Remove Software
+Comment=Install, update, and search for applications
+Exec=pamac-manager
+Icon=system-software-install
+Terminal=false
+EOF_ICON
+
+    cat > "$target_dir/Sona AI Assistant.desktop" << 'EOF_ICON'
+[Desktop Entry]
+Type=Application
+Name=Sona AI Assistant
+Comment=Ask questions about Sona Linux and Orca shortcuts (Alt+Super+H)
+Exec=mate-terminal --title="Sona AI Assistant" -e /usr/local/bin/sona-ai
+Icon=utilities-terminal
+Terminal=false
+EOF_ICON
+
+    cat > "$target_dir/Instant Screen OCR.desktop" << 'EOF_ICON'
+[Desktop Entry]
+Type=Application
+Name=Instant Screen OCR
+Comment=Read text from inaccessible images or windows (Alt+Super+O)
+Exec=/usr/local/bin/sona-ocr
+Icon=scanner
+Terminal=false
+EOF_ICON
+
+    cat > "$target_dir/Word Processor.desktop" << 'EOF_ICON'
+[Desktop Entry]
+Type=Application
+Name=Word Processor
+Comment=Create and edit documents with LibreOffice Writer
+Exec=libreoffice --writer %U
+Icon=libreoffice-writer
+Terminal=false
+EOF_ICON
+
+    cat > "$target_dir/Spreadsheet.desktop" << 'EOF_ICON'
+[Desktop Entry]
+Type=Application
+Name=Spreadsheet
+Comment=Create and edit spreadsheets with LibreOffice Calc
+Exec=libreoffice --calc %U
+Icon=libreoffice-calc
+Terminal=false
+EOF_ICON
+
+    cat > "$target_dir/Thorium Book Reader.desktop" << 'EOF_ICON'
+[Desktop Entry]
+Type=Application
+Name=Thorium Book Reader
+Comment=Read BARD, Bookshare, DAISY, and EPUB books
+Exec=thorium-reader %U
+Icon=thorium-reader
+Terminal=false
+EOF_ICON
+
+    cat > "$target_dir/OCR Document Scanner (LIOS).desktop" << 'EOF_ICON'
+[Desktop Entry]
+Type=Application
+Name=OCR Document Scanner (LIOS)
+Comment=Scan paper documents and PDFs into readable text
+Exec=lios
+Icon=scanner
+Terminal=false
+EOF_ICON
+
+    cat > "$target_dir/VLC Media Player.desktop" << 'EOF_ICON'
+[Desktop Entry]
+Type=Application
+Name=VLC Media Player
+Comment=Play audio and video files
+Exec=vlc %U
+Icon=vlc
+Terminal=false
+EOF_ICON
+
+    cat > "$target_dir/CD Ripper.desktop" << 'EOF_ICON'
+[Desktop Entry]
+Type=Application
+Name=CD Ripper
+Comment=Rip audio CDs with Sound Juicer
+Exec=sound-juicer %u
+Icon=org.gnome.SoundJuicer
+Terminal=false
+EOF_ICON
+
+    cat > "$target_dir/Sound and Volume Control.desktop" << 'EOF_ICON'
+[Desktop Entry]
+Type=Application
+Name=Sound and Volume Control
+Comment=Adjust speaker, headphone, and microphone levels
+Exec=pavucontrol
+Icon=multimedia-volume-control
+Terminal=false
+EOF_ICON
+
+    cat > "$target_dir/Bluetooth Devices.desktop" << 'EOF_ICON'
+[Desktop Entry]
+Type=Application
+Name=Bluetooth Devices
+Comment=Pair and manage Bluetooth speakers, headphones, and keyboards
+Exec=blueman-manager
+Icon=bluetooth
+Terminal=false
+EOF_ICON
+
+    cat > "$target_dir/System Restore (Timeshift).desktop" << 'EOF_ICON'
+[Desktop Entry]
+Type=Application
+Name=System Restore (Timeshift)
+Comment=Create or restore system backup snapshots
+Exec=timeshift-launcher
+Icon=timeshift
+Terminal=false
+EOF_ICON
+
+    chmod +x "$target_dir"/*.desktop
+}
+
+create_desktop_shortcuts "/home/$USERNAME/Desktop"
+create_desktop_shortcuts "/etc/skel/Desktop"
+
+# 17. Set Google Chrome and Thunderbird as default applications
+mkdir -p /etc/xdg "/home/$USERNAME/.config"
+cat > /etc/xdg/mimeapps.list << MIMEAPPS
+[Default Applications]
+text/html=google-chrome.desktop
+x-scheme-handler/http=google-chrome.desktop
+x-scheme-handler/https=google-chrome.desktop
+x-scheme-handler/about=google-chrome.desktop
+x-scheme-handler/unknown=google-chrome.desktop
+x-scheme-handler/mailto=thunderbird.desktop
+message/rfc822=thunderbird.desktop
+
+[Added Associations]
+text/html=google-chrome.desktop;
+x-scheme-handler/http=google-chrome.desktop;
+x-scheme-handler/https=google-chrome.desktop;
+x-scheme-handler/mailto=thunderbird.desktop;
+message/rfc822=thunderbird.desktop;
+MIMEAPPS
+
+cp /etc/xdg/mimeapps.list "/home/$USERNAME/.config/mimeapps.list"
+
+# 18. Autostart Orca, CopyQ, Desktop Icon Trust Helper, and Login Sound
+cat > /usr/local/bin/sona-session-init << 'SESSION_INIT'
+#!/bin/bash
+for f in "$HOME"/Desktop/*.desktop; do
+    [[ -f "$f" ]] || continue
+    chmod +x "$f" 2>/dev/null || true
+    gio set "$f" metadata::trusted true 2>/dev/null || true
+done
+paplay /usr/share/sounds/freedesktop/stereo/service-login.oga 2>/dev/null &
+SESSION_INIT
+chmod +x /usr/local/bin/sona-session-init
+
+mkdir -p "/home/$USERNAME/.config/autostart" /etc/skel/.config/autostart
+
+cat > "/home/$USERNAME/.config/autostart/orca.desktop" << DESKTOP
 [Desktop Entry]
 Type=Application
 Name=Orca
 Exec=orca
 X-GNOME-Autostart-enabled=true
-OnlyShowIn=MATE;GNOME;XFCE;
+OnlyShowIn=MATE;
 DESKTOP
-chown -R $USERNAME:$USERNAME /home/$USERNAME
 
-# Optional extras
-[[ "$ENABLE_BT"      == "y" ]] && install bluez bluez-utils && systemctl enable bluetooth
-[[ "$INSTALL_FLATPAK"== "y" ]] && install flatpak && flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
-[[ "$INSTALL_DEV"    == "y" ]] && install base-devel git python python-pip rust nodejs npm go jdk-openjdk
-[[ "$INSTALL_ACC"    == "y" ]] && install wine festival speech-tools speech-dispatcher espeak-ng
-[[ "$INSTALL_ANDROID"== "y" ]] && install waydroid aosp-uiautomator && echo "Waydroid installed — run 'sudo waydroid init' after reboot"
+cat > "/home/$USERNAME/.config/autostart/copyq.desktop" << DESKTOP
+[Desktop Entry]
+Type=Application
+Name=CopyQ Clipboard History
+Exec=copyq
+X-GNOME-Autostart-enabled=true
+OnlyShowIn=MATE;
+DESKTOP
 
-# GRUB installation
-if ! grep -q "^GRUB_DISABLE_OS_PROBER=false" /etc/default/grub; then
-  echo "GRUB_DISABLE_OS_PROBER=false" >> /etc/default/grub
-fi
-if [[ -d /sys/firmware/efi ]]; then
-  grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
+cat > "/home/$USERNAME/.config/autostart/sona-session-init.desktop" << DESKTOP
+[Desktop Entry]
+Type=Application
+Name=Sona Desktop Session Init
+Exec=/usr/local/bin/sona-session-init
+X-GNOME-Autostart-enabled=true
+OnlyShowIn=MATE;
+DESKTOP
+
+cp "/home/$USERNAME/.config/autostart/"*.desktop /etc/skel/.config/autostart/
+chown -R "$USERNAME:$USERNAME" "/home/$USERNAME"
+
+# 19. GRUB bootloader
+if grep -q '^#\?GRUB_DISABLE_OS_PROBER=' /etc/default/grub; then
+    sed -i 's/^#\?GRUB_DISABLE_OS_PROBER=.*/GRUB_DISABLE_OS_PROBER=false/' /etc/default/grub
 else
-  grub-install --target=i386-pc --recheck $DISK
+    echo "GRUB_DISABLE_OS_PROBER=false" >> /etc/default/grub
+fi
+
+if [[ -d /sys/firmware/efi ]]; then
+    grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB --recheck
+else
+    grub-install --target=i386-pc --recheck "$DISK"
 fi
 grub-mkconfig -o /boot/grub/grub.cfg
-
 EOF
 
-log "✅ Installation complete! Run: umount -R /mnt && reboot"
+chmod +x /mnt/root/setup-chroot.sh
 
-  
+echo "Configuring Sona Linux inside chroot..."
+arch-chroot /mnt /root/setup-chroot.sh
+
+rm -f /mnt/root/setup-chroot.sh /mnt/root/install.conf
+
+umount -R /mnt
+
+ui_msg "Installation Complete" "Sona Linux has been installed! Remove your installation media and press Enter to reboot."
+reboot
