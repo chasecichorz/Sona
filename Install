@@ -1,47 +1,154 @@
 #!/bin/bash
 # Sona Linux Installer
 # Accessible Arch Linux + MATE + XLibre with Debian-style TUI
+#
+# Run as root from an Arch Linux live ISO (or the Sona live ISO).
+# Works on both UEFI and legacy BIOS computers.
 
-set -euo pipefail
+set -Eeuo pipefail
 
 BACKTITLE="Sona Linux Accessible Installer"
 SELECTED_SSID=""
 WIFI_PASS=""
+MOUNTED=false
+
+# ---------------------------------------------------------------------------
+# Error handling
+# ---------------------------------------------------------------------------
+
+# Exit code 130 means the user cancelled a dialog; that is not an error.
+on_error() {
+    local rc=$? line=$1
+    if [[ $rc -eq 130 ]]; then
+        exit 130
+    fi
+    echo >&2
+    echo "Error: the installer stopped unexpectedly at line $line (exit code $rc)." >&2
+    echo "Scroll up to read the last command's output for details." >&2
+    if [[ "$MOUNTED" == true ]]; then
+        # Never leave the saved passwords behind on the target disk.
+        rm -f /mnt/root/install.conf /mnt/root/setup-chroot.sh 2>/dev/null || true
+        umount -R /mnt 2>/dev/null || true
+    fi
+    exit "$rc"
+}
+trap 'on_error $LINENO' ERR
+
+err() {
+    printf "Error: %s\n" "$1" >&2
+    if [[ "$MOUNTED" == true ]]; then
+        # Never leave the saved passwords behind on the target disk.
+        rm -f /mnt/root/install.conf /mnt/root/setup-chroot.sh 2>/dev/null || true
+        umount -R /mnt 2>/dev/null || true
+    fi
+    exit 1
+}
+
+user_cancelled() {
+    clear
+    echo "Installer cancelled." >&2
+    exit 130
+}
+
+# ---------------------------------------------------------------------------
+# Dialog helpers
+# Pressing Cancel or Escape in any input or menu quits the installer cleanly.
+# ---------------------------------------------------------------------------
 
 ui_msg() {
-    whiptail --backtitle "$BACKTITLE" --title "$1" --msgbox "$2" 12 70
+    whiptail --backtitle "$BACKTITLE" --title "$1" --msgbox "$2" 14 74
 }
 
 ui_input() {
-    local title="$1" prompt="$2" default="${3:-}"
-    whiptail --backtitle "$BACKTITLE" --title "$title" --inputbox "$prompt" 10 70 "$default" 3>&1 1>&2 2>&3
+    local title="$1" prompt="$2" default="${3:-}" out
+    if ! out=$(whiptail --backtitle "$BACKTITLE" --title "$title" --inputbox "$prompt" 10 74 "$default" 3>&1 1>&2 2>&3); then
+        user_cancelled
+    fi
+    printf '%s' "$out"
 }
 
 ui_pass() {
-    local title="$1" prompt="$2"
-    whiptail --backtitle "$BACKTITLE" --title "$title" --passwordbox "$prompt" 10 70 3>&1 1>&2 2>&3
+    local title="$1" prompt="$2" out
+    if ! out=$(whiptail --backtitle "$BACKTITLE" --title "$title" --passwordbox "$prompt" 10 74 3>&1 1>&2 2>&3); then
+        user_cancelled
+    fi
+    printf '%s' "$out"
 }
 
+# ui_menu TITLE PROMPT TAG ITEM [TAG ITEM ...]
+ui_menu() {
+    local title="$1" prompt="$2" out
+    shift 2
+    if ! out=$(whiptail --backtitle "$BACKTITLE" --title "$title" --menu "$prompt" 20 76 10 "$@" 3>&1 1>&2 2>&3); then
+        user_cancelled
+    fi
+    printf '%s' "$out"
+}
+
+# Prints y or n. Escape counts as n.
 ui_yesno() {
-    local title="$1" prompt="$2"
-    if whiptail --backtitle "$BACKTITLE" --title "$title" --yesno "$prompt" 10 70; then
+    if whiptail --backtitle "$BACKTITLE" --title "$1" --yesno "$2" 12 74; then
         echo "y"
     else
         echo "n"
     fi
 }
 
-err() {
-    printf "Error: %s\n" "$1" >&2
-    exit 1
+# Same as ui_yesno, but No is selected by default. Use for anything destructive.
+ui_yesno_default_no() {
+    if whiptail --backtitle "$BACKTITLE" --title "$1" --defaultno --yesno "$2" 14 74; then
+        echo "y"
+    else
+        echo "n"
+    fi
 }
 
+# Partition device name: /dev/sda + 2 = /dev/sda2, /dev/nvme0n1 + 2 = /dev/nvme0n1p2
+part_path() {
+    local disk="$1" num="$2"
+    if [[ "$disk" =~ [0-9]$ ]]; then
+        echo "${disk}p${num}"
+    else
+        echo "${disk}${num}"
+    fi
+}
+
+# lsblk_field KEY LINE: read one value from a line of `lsblk -P` output.
+lsblk_field() {
+    local re="(^|[[:space:]])$1=\"([^\"]*)\""
+    if [[ "$2" =~ $re ]]; then
+        printf '%s' "${BASH_REMATCH[2]}"
+    fi
+}
+
+wait_for_device() {
+    local dev="$1" tries=0
+    while [[ ! -b "$dev" ]]; do
+        tries=$((tries + 1))
+        if [[ $tries -gt 20 ]]; then
+            err "Partition $dev did not appear after partitioning."
+        fi
+        sleep 0.5
+    done
+}
+
+# ---------------------------------------------------------------------------
 # 1. Preflight checks
+# ---------------------------------------------------------------------------
+
 if [[ $EUID -ne 0 ]]; then
     err "This installer must be run as root."
 fi
 
-for cmd in parted pacstrap arch-chroot whiptail; do
+# The stock Arch ISO does not include whiptail (package libnewt).
+if ! command -v whiptail >/dev/null 2>&1; then
+    echo "Installing whiptail for the installer menus..."
+    if ! pacman -Sy --noconfirm --needed libnewt; then
+        err "Could not install whiptail. Connect to the internet first (for Wi-Fi run: iwctl station wlan0 connect YOUR-NETWORK), then run the installer again."
+    fi
+fi
+
+for cmd in whiptail lsblk sgdisk partprobe udevadm wipefs mkfs.fat mkfs.ext4 pacstrap arch-chroot genfstab findmnt; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         err "Required command '$cmd' is missing."
     fi
@@ -49,13 +156,36 @@ done
 
 umount -R /mnt 2>/dev/null || true
 
-# 2. Network and Dynamic Wi-Fi Setup
+if [[ -d /sys/firmware/efi ]]; then
+    BOOT_MODE="uefi"
+else
+    BOOT_MODE="bios"
+fi
+
+ui_msg "Welcome" "Welcome to the Sona Linux installer.
+
+This computer started in ${BOOT_MODE^^} mode, so Sona will be set up to boot the same way.
+
+Press Enter to continue. You can press Escape on any question to quit before any disk is changed."
+
+# ---------------------------------------------------------------------------
+# 2. Network and Wi-Fi setup
+# ---------------------------------------------------------------------------
+
+have_internet() {
+    ping -c 1 -W 3 archlinux.org >/dev/null 2>&1 || ping -c 1 -W 3 1.1.1.1 >/dev/null 2>&1
+}
+
 setup_network() {
-    local net_type wifi_iface selected_idx
-    net_type=$(whiptail --backtitle "$BACKTITLE" --title "Network Connection" \
-        --menu "How are you connecting to the internet?" 12 70 2 \
-        "1" "Wi-Fi (Scan and select a wireless network)" \
-        "2" "Ethernet (Plugged in via cable)" 3>&1 1>&2 2>&3)
+    local net_type wifi_iface selected_idx menu_items i
+
+    if have_internet; then
+        return 0
+    fi
+
+    net_type=$(ui_menu "Network Connection" "How are you connecting to the internet?" \
+        "1" "Wi-Fi (scan and select a wireless network)" \
+        "2" "Ethernet (plugged in with a cable)")
 
     if [[ "$net_type" == "1" ]]; then
         wifi_iface=""
@@ -75,6 +205,7 @@ setup_network() {
 
         while true; do
             echo "Scanning for Wi-Fi networks on $wifi_iface..."
+            SSIDS=()
             if command -v iwctl >/dev/null 2>&1; then
                 iwctl station "$wifi_iface" scan >/dev/null 2>&1 || true
                 sleep 3
@@ -96,9 +227,8 @@ setup_network() {
             if [[ ${#SSIDS[@]} -eq 0 ]]; then
                 if [[ $(ui_yesno "No Networks Found" "No Wi-Fi networks were found. Scan again?") == "y" ]]; then
                     continue
-                else
-                    err "Could not find any Wi-Fi networks."
                 fi
+                err "Could not find any Wi-Fi networks."
             fi
 
             menu_items=()
@@ -106,12 +236,10 @@ setup_network() {
                 menu_items+=("$((i + 1))" "${SSIDS[$i]}")
             done
 
-            selected_idx=$(whiptail --backtitle "$BACKTITLE" --title "Select Wi-Fi Network" \
-                --menu "Use Up/Down arrows or press a number to choose your Wi-Fi:" 18 70 10 \
-                "${menu_items[@]}" 3>&1 1>&2 2>&3)
+            selected_idx=$(ui_menu "Select Wi-Fi Network" "Use Up and Down arrows or press a number to choose your Wi-Fi:" "${menu_items[@]}")
 
             SELECTED_SSID="${SSIDS[$((selected_idx - 1))]}"
-            WIFI_PASS=$(ui_pass "Wi-Fi Password" "Enter password for $SELECTED_SSID (leave blank if open):")
+            WIFI_PASS=$(ui_pass "Wi-Fi Password" "Enter the password for $SELECTED_SSID (leave blank if it is open):")
 
             echo "Connecting to $SELECTED_SSID..."
             if command -v iwctl >/dev/null 2>&1; then
@@ -129,7 +257,7 @@ setup_network() {
             fi
 
             sleep 4
-            if ping -c 1 -W 3 archlinux.org >/dev/null 2>&1 || ping -c 1 -W 3 1.1.1.1 >/dev/null 2>&1; then
+            if have_internet; then
                 break
             fi
 
@@ -137,35 +265,50 @@ setup_network() {
                 err "Network setup aborted."
             fi
         done
+    else
+        echo "Waiting for the wired connection..."
+        sleep 5
     fi
 
-    if ! ping -c 1 -W 3 archlinux.org >/dev/null 2>&1 && ! ping -c 1 -W 3 1.1.1.1 >/dev/null 2>&1; then
+    if ! have_internet; then
         err "No internet connection detected."
     fi
 }
 
 setup_network
 
-echo "Initializing keyring and selecting fastest mirrors..."
-sed -i 's/^#ParallelDownloads.*/ParallelDownloads = 5/' /etc/pacman.conf
+echo "Initializing keyring and selecting fast mirrors..."
+sed -i 's/^#\?ParallelDownloads.*/ParallelDownloads = 5/' /etc/pacman.conf
 pacman-key --init
 pacman-key --populate archlinux
-pacman -Sy --noconfirm --needed reflector
-reflector --country US --latest 10 --protocol https --sort rate --save /etc/pacman.d/mirrorlist
+pacman -Sy --noconfirm --needed archlinux-keyring reflector
+if ! reflector --latest 20 --protocol https --sort rate --save /etc/pacman.d/mirrorlist; then
+    echo "Warning: mirror ranking failed. Using the existing mirror list."
+fi
 
-# 3. User and System Settings
+# ---------------------------------------------------------------------------
+# 3. User and system settings
+# ---------------------------------------------------------------------------
+
 FULLNAME=$(ui_input "User Setup" "Enter your full name:" "Sona User")
 
 while true; do
     USERNAME=$(ui_input "User Setup" "Enter a lowercase username (no spaces):" "sona")
     USERNAME="${USERNAME,,}"
-    if [[ "$USERNAME" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+    if [[ "$USERNAME" =~ ^[a-z_][a-z0-9_-]{0,31}$ && "$USERNAME" != "root" ]]; then
         break
     fi
-    ui_msg "Invalid Username" "Username must start with a letter and contain only lowercase letters, numbers, or hyphens."
+    ui_msg "Invalid Username" "The username must start with a letter, be 32 characters or fewer, and use only lowercase letters, numbers, underscores, or hyphens."
 done
 
-HOSTNAME=$(ui_input "Computer Name" "Enter a name for this computer (hostname):" "sona-pc")
+while true; do
+    HOSTNAME=$(ui_input "Computer Name" "Enter a name for this computer (hostname):" "sona-pc")
+    HOSTNAME="${HOSTNAME,,}"
+    if [[ "$HOSTNAME" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
+        break
+    fi
+    ui_msg "Invalid Computer Name" "The computer name can use only letters, numbers, and hyphens, and cannot start or end with a hyphen."
+done
 
 while true; do
     PASSWORD=$(ui_pass "Password Setup" "Enter a password for $USERNAME:")
@@ -173,107 +316,267 @@ while true; do
     if [[ -n "$PASSWORD" && "$PASSWORD" == "$PASS_CONFIRM" ]]; then
         break
     fi
-    ui_msg "Password Mismatch" "Passwords did not match or were blank. Please try again."
+    ui_msg "Password Mismatch" "The passwords did not match or were blank. Please try again."
 done
+
+if [[ $(ui_yesno "Administrator Password" "Use the same password for the root (administrator) account?
+
+Choose No to set a separate root password.") == "y" ]]; then
+    ROOT_PASSWORD="$PASSWORD"
+else
+    while true; do
+        ROOT_PASSWORD=$(ui_pass "Root Password" "Enter a password for the root account:")
+        ROOT_CONFIRM=$(ui_pass "Root Password" "Confirm the root password:")
+        if [[ -n "$ROOT_PASSWORD" && "$ROOT_PASSWORD" == "$ROOT_CONFIRM" ]]; then
+            break
+        fi
+        ui_msg "Password Mismatch" "The passwords did not match or were blank. Please try again."
+    done
+fi
 
 AUTOLOGIN=$(ui_yesno "Automatic Login" "Log into the MATE desktop automatically on startup without asking for your password?")
 
-TZ_CHOICE=$(whiptail --backtitle "$BACKTITLE" --title "Time Zone" \
-    --menu "Select your time zone:" 16 70 8 \
-    "1" "America/New_York (Eastern)" \
-    "2" "America/Chicago (Central)" \
-    "3" "America/Denver (Mountain)" \
-    "4" "America/Los_Angeles (Pacific)" \
-    "5" "UTC" \
-    "6" "Europe/London" \
-    "7" "Manual Entry" 3>&1 1>&2 2>&3)
+while true; do
+    TZ_CHOICE=$(ui_menu "Time Zone" "Select your time zone:" \
+        "1" "America/New_York (Eastern)" \
+        "2" "America/Chicago (Central)" \
+        "3" "America/Denver (Mountain)" \
+        "4" "America/Phoenix (Arizona)" \
+        "5" "America/Los_Angeles (Pacific)" \
+        "6" "UTC" \
+        "7" "Europe/London" \
+        "8" "Type a time zone")
 
-case "$TZ_CHOICE" in
-    1) TIMEZONE="America/New_York" ;;
-    2) TIMEZONE="America/Chicago" ;;
-    3) TIMEZONE="America/Denver" ;;
-    4) TIMEZONE="America/Los_Angeles" ;;
-    5) TIMEZONE="UTC" ;;
-    6) TIMEZONE="Europe/London" ;;
-    7) TIMEZONE=$(ui_input "Time Zone" "Enter full time zone (e.g. America/Chicago):" "America/Chicago") ;;
-esac
+    case "$TZ_CHOICE" in
+        1) TIMEZONE="America/New_York" ;;
+        2) TIMEZONE="America/Chicago" ;;
+        3) TIMEZONE="America/Denver" ;;
+        4) TIMEZONE="America/Phoenix" ;;
+        5) TIMEZONE="America/Los_Angeles" ;;
+        6) TIMEZONE="UTC" ;;
+        7) TIMEZONE="Europe/London" ;;
+        8) TIMEZONE=$(ui_input "Time Zone" "Enter a full time zone name, for example America/Chicago:" "America/Chicago") ;;
+    esac
 
-LANG_LOCALE=$(ui_input "Language Locale" "Confirm system locale:" "en_US.UTF-8")
-CONSOLE_KEYMAP=$(ui_input "Console Keymap" "Confirm console keyboard layout:" "us")
-X11_KEYBOARD=$(ui_input "Desktop Keyboard" "Confirm desktop keyboard layout:" "us")
-
-# 4. Disk Selection and Partitioning (1 GiB EFI Partition)
-mapfile -t DISK_LINES < <(lsblk -d -n -e 7,11 -o NAME,SIZE,MODEL)
-if [[ ${#DISK_LINES[@]} -eq 0 ]]; then
-    err "No storage drives detected."
-fi
-
-disk_menu=()
-DISK_NAMES=()
-for i in "${!DISK_LINES[@]}"; do
-    d_name=$(echo "${DISK_LINES[$i]}" | awk '{print $1}')
-    d_info=$(echo "${DISK_LINES[$i]}" | cut -d' ' -f2-)
-    DISK_NAMES+=("$d_name")
-    disk_menu+=("$((i + 1))" "/dev/$d_name ($d_info)")
+    if [[ -f "/usr/share/zoneinfo/$TIMEZONE" ]]; then
+        break
+    fi
+    ui_msg "Unknown Time Zone" "\"$TIMEZONE\" is not a known time zone. Please try again."
 done
 
-disk_idx=$(whiptail --backtitle "$BACKTITLE" --title "Select Installation Drive" \
-    --menu "Choose the drive to install Sona Linux onto:" 15 70 6 \
-    "${disk_menu[@]}" 3>&1 1>&2 2>&3)
+while true; do
+    LANG_LOCALE=$(ui_input "Language Locale" "Confirm the system locale:" "en_US.UTF-8")
+    if grep -q "^${LANG_LOCALE//./\\.} UTF-8" /usr/share/i18n/SUPPORTED 2>/dev/null; then
+        break
+    fi
+    ui_msg "Unknown Locale" "\"$LANG_LOCALE\" is not a supported UTF-8 locale. Use a name like en_US.UTF-8 or en_GB.UTF-8."
+done
 
-DISK="/dev/${DISK_NAMES[$((disk_idx - 1))]}"
+CONSOLE_KEYMAP=$(ui_input "Console Keymap" "Confirm the console keyboard layout:" "us")
+X11_KEYBOARD=$(ui_input "Desktop Keyboard" "Confirm the desktop keyboard layout:" "us")
 
-PART_MODE=$(whiptail --backtitle "$BACKTITLE" --title "Partitioning Method" \
-    --menu "How would you like to partition $DISK?" 12 70 2 \
-    "1" "Erase entire disk and setup Sona Linux automatically" \
-    "2" "Manual dual-boot (use existing partitions)" 3>&1 1>&2 2>&3)
+# ---------------------------------------------------------------------------
+# 4. Disk selection and partitioning
+# ---------------------------------------------------------------------------
+
+# Never offer the USB stick the installer is running from.
+LIVE_DISK=""
+if live_src=$(findmnt -no SOURCE /run/archiso/bootmnt 2>/dev/null); then
+    live_parent=$(lsblk -no PKNAME "$live_src" 2>/dev/null | head -n 1 || true)
+    if [[ -n "$live_parent" ]]; then
+        LIVE_DISK="/dev/$live_parent"
+    else
+        LIVE_DISK="$live_src"
+    fi
+fi
+
+DISK_NAMES=()
+DISK_DESC=()
+disk_menu=()
+while read -r d_name d_type d_ro d_size d_model; do
+    [[ "$d_type" == "disk" ]] || continue
+    [[ "$d_ro" == "0" ]] || continue
+    [[ "$d_name" == "$LIVE_DISK" ]] && continue
+    [[ "$d_name" == /dev/zram* ]] && continue
+    DISK_NAMES+=("$d_name")
+    DISK_DESC+=("$d_name, $d_size, ${d_model:-unknown model}")
+    disk_menu+=("${#DISK_NAMES[@]}" "$d_name  $d_size  ${d_model:-unknown model}")
+done < <(lsblk -dnpo NAME,TYPE,RO,SIZE,MODEL)
+
+if [[ ${#DISK_NAMES[@]} -eq 0 ]]; then
+    err "No storage drives were found to install to."
+fi
+
+disk_idx=$(ui_menu "Select Installation Drive" "Choose the drive to install Sona Linux onto:" "${disk_menu[@]}")
+DISK="${DISK_NAMES[$((disk_idx - 1))]}"
+DISK_LABEL="${DISK_DESC[$((disk_idx - 1))]}"
+
+PART_MODE=$(ui_menu "Partitioning Method" "How would you like to install onto $DISK_LABEL?" \
+    "1" "Erase the entire drive and set up Sona Linux automatically" \
+    "2" "Dual-boot: use a partition I already created for Sona")
+
+EFI_PART=""
+GRUB_REMOVABLE="no"
+ESP_TYPE="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
+BIOS_BOOT_TYPE="21686148-6449-6e6f-744e-656564454649"
 
 if [[ "$PART_MODE" == "2" ]]; then
-    EFI_PART=$(ui_input "Dual-Boot Setup" "Enter existing EFI partition path (e.g. /dev/nvme0n1p1):" "")
-    ROOT_PART=$(ui_input "Dual-Boot Setup" "Enter target Linux root partition path (e.g. /dev/nvme0n1p2):" "")
-    if [[ $(ui_yesno "Confirm Format" "Format $ROOT_PART as ext4?") != "y" ]]; then
-        err "Installation cancelled by user."
-    fi
-    mkfs.ext4 -F "$ROOT_PART"
-else
-    if [[ $(ui_yesno "Confirm Disk Erase" "WARNING: Everything on $DISK will be permanently erased. Continue?") != "y" ]]; then
-        err "Installation cancelled by user."
-    fi
+    # --- EFI system partition (UEFI only) ---
+    if [[ "$BOOT_MODE" == "uefi" ]]; then
+        ESP_LIST=()
+        esp_menu=()
+        while IFS= read -r line; do
+            p_name=$(lsblk_field NAME "$line")
+            p_ptype=$(lsblk_field PARTTYPE "$line")
+            p_size=$(lsblk_field SIZE "$line")
+            p_parent=$(lsblk_field PKNAME "$line")
+            # Skip the EFI partition on the installer USB itself.
+            if [[ -n "$LIVE_DISK" && "${p_parent#/dev/}" == "${LIVE_DISK#/dev/}" ]]; then
+                continue
+            fi
+            if [[ "${p_ptype,,}" == "$ESP_TYPE" ]]; then
+                ESP_LIST+=("$p_name")
+                esp_menu+=("${#ESP_LIST[@]}" "$p_name  $p_size")
+            fi
+        done < <(lsblk -npP -o NAME,PARTTYPE,SIZE,PKNAME)
 
-    parted -s "$DISK" \
-        mklabel gpt \
-        mkpart ESP fat32 1MiB 1025MiB \
-        set 1 esp on \
-        mkpart root ext4 1025MiB 100%
-
-    if [[ "$DISK" =~ (nvme|mmcblk|loop) ]]; then
-        EFI_PART="${DISK}p1"
-        ROOT_PART="${DISK}p2"
+        if [[ ${#ESP_LIST[@]} -eq 0 ]]; then
+            err "No EFI system partition was found. Dual-boot on a UEFI computer needs the one Windows or your other system already uses."
+        elif [[ ${#ESP_LIST[@]} -eq 1 ]]; then
+            EFI_PART="${ESP_LIST[0]}"
+            ui_msg "EFI Partition" "Sona will add its boot loader to the existing EFI partition $EFI_PART. It will not be formatted, and your other system's boot files will be kept."
+        else
+            esp_idx=$(ui_menu "EFI Partition" "Choose the existing EFI partition to add the Sona boot loader to. It will not be formatted:" "${esp_menu[@]}")
+            EFI_PART="${ESP_LIST[$((esp_idx - 1))]}"
+        fi
     else
-        EFI_PART="${DISK}1"
-        ROOT_PART="${DISK}2"
+        # Legacy BIOS on a GPT drive needs a BIOS boot partition for GRUB.
+        pttype=$(blkid -o value -s PTTYPE "$DISK" 2>/dev/null || true)
+        if [[ "$pttype" == "gpt" ]] && ! lsblk -lnpo PARTTYPE "$DISK" | grep -qi "$BIOS_BOOT_TYPE"; then
+            err "$DISK uses a GPT partition table but has no 1 MiB BIOS boot partition, so GRUB cannot be installed on this BIOS computer. Create one with gdisk (type code EF02) and run the installer again."
+        fi
     fi
 
-    mkfs.fat -F 32 "$EFI_PART"
-    mkfs.ext4 -F "$ROOT_PART"
+    # --- Root partition ---
+    ROOT_LIST=()
+    ROOT_FS=()
+    root_menu=()
+    # lsblk -P prints KEY="value" pairs, so empty columns cannot shift.
+    while IFS= read -r line; do
+        p_name=$(lsblk_field NAME "$line")
+        p_type=$(lsblk_field TYPE "$line")
+        p_size=$(lsblk_field SIZE "$line")
+        p_fstype=$(lsblk_field FSTYPE "$line")
+        p_ptype=$(lsblk_field PARTTYPE "$line")
+        p_label=$(lsblk_field LABEL "$line")
+        [[ "$p_type" == "part" ]] || continue
+        [[ "${p_ptype,,}" == "$ESP_TYPE" || "${p_ptype,,}" == "$BIOS_BOOT_TYPE" ]] && continue
+        [[ "$p_name" == "$EFI_PART" ]] && continue
+        ROOT_LIST+=("$p_name")
+        ROOT_FS+=("$p_fstype")
+        root_menu+=("${#ROOT_LIST[@]}" "$p_name  $p_size  ${p_fstype:-unformatted}  ${p_label}")
+    done < <(lsblk -npP -o NAME,TYPE,SIZE,FSTYPE,PARTTYPE,LABEL "$DISK")
+
+    if [[ ${#ROOT_LIST[@]} -eq 0 ]]; then
+        err "No usable partitions were found on $DISK. Shrink your other system first to make free space, create a partition for Sona, and run the installer again."
+    fi
+
+    root_idx=$(ui_menu "Sona Partition" "Choose the partition to install Sona Linux onto. It will be erased and formatted:" "${root_menu[@]}")
+    ROOT_PART="${ROOT_LIST[$((root_idx - 1))]}"
+    root_fs="${ROOT_FS[$((root_idx - 1))]}"
+
+    case "$root_fs" in
+        ""|ext4|ext3|ext2|btrfs|xfs)
+            ;;
+        *)
+            if [[ $(ui_yesno_default_no "Existing Data Found" "$ROOT_PART contains a $root_fs file system. It may hold Windows or your personal files.
+
+Erasing it will destroy everything on it. Are you sure this is the right partition?") != "y" ]]; then
+                err "Installation cancelled by user."
+            fi
+            ;;
+    esac
+
+    if [[ $(ui_yesno_default_no "Confirm Format" "Format $ROOT_PART as ext4 and install Sona Linux on it?
+
+Everything on $ROOT_PART will be permanently erased. Other partitions will not be touched.") != "y" ]]; then
+        err "Installation cancelled by user."
+    fi
+
+    umount "$ROOT_PART" 2>/dev/null || true
+    swapoff "$ROOT_PART" 2>/dev/null || true
+    wipefs -af "$ROOT_PART"
+    mkfs.ext4 -F -L SonaRoot "$ROOT_PART"
+else
+    if [[ $(ui_yesno_default_no "Confirm Drive Erase" "WARNING: Everything on this drive will be permanently erased:
+
+$DISK_LABEL
+
+Continue?") != "y" ]]; then
+        err "Installation cancelled by user."
+    fi
+
+    echo "Partitioning $DISK..."
+    while read -r p; do
+        umount "$p" 2>/dev/null || true
+        swapoff "$p" 2>/dev/null || true
+    done < <(lsblk -lnpo NAME "$DISK" | tail -n +2)
+
+    wipefs -af "$DISK"
+    sgdisk --zap-all "$DISK"
+    # 1: 1 MiB BIOS boot (lets GRUB boot on legacy BIOS)
+    # 2: 1 GiB EFI system partition
+    # 3: Linux root, rest of the drive
+    sgdisk \
+        -n 1:2048:+1M  -t 1:EF02 -c 1:BIOSBOOT \
+        -n 2:0:+1G     -t 2:EF00 -c 2:EFI \
+        -n 3:0:0       -t 3:8304 -c 3:SonaRoot \
+        "$DISK"
+    partprobe "$DISK"
+    udevadm settle
+
+    EFI_PART=$(part_path "$DISK" 2)
+    ROOT_PART=$(part_path "$DISK" 3)
+    wait_for_device "$EFI_PART"
+    wait_for_device "$ROOT_PART"
+
+    mkfs.fat -F 32 -n EFI "$EFI_PART"
+    mkfs.ext4 -F -L SonaRoot "$ROOT_PART"
+
+    # On a wiped drive it is safe to also install GRUB to the fallback EFI
+    # path, so firmware that forgets boot entries can still start Sona.
+    GRUB_REMOVABLE="yes"
 fi
 
 mount "$ROOT_PART" /mnt
-mkdir -p /mnt/boot
-mount "$EFI_PART" /mnt/boot
-
-# 5. Detect CPU Microcode Before Pacstrap
-UCODE_PKG=""
-cpu_vendor=$(awk '/vendor_id/ {print $3; exit}' /proc/cpuinfo)
-if [[ "$cpu_vendor" == "GenuineIntel" ]]; then
-    UCODE_PKG="intel-ucode"
-elif [[ "$cpu_vendor" == "AuthenticAMD" ]]; then
-    UCODE_PKG="amd-ucode"
+MOUNTED=true
+if [[ -n "$EFI_PART" ]]; then
+    mkdir -p /mnt/boot/efi
+    mount "$EFI_PART" /mnt/boot/efi
+    esp_free=$(df --output=avail -m /mnt/boot/efi | tail -n 1 | tr -d ' ')
+    if [[ "$esp_free" -lt 20 ]]; then
+        err "The EFI partition $EFI_PART has only ${esp_free} MB free. Sona needs at least 20 MB there for its boot loader."
+    fi
 fi
 
-# 6. Core Base System Pacstrap (Strictly guaranteed core/extra packages)
+# ---------------------------------------------------------------------------
+# 5. Detect CPU microcode before pacstrap
+# ---------------------------------------------------------------------------
+
+UCODE_PKG=()
+cpu_vendor=$(awk '/vendor_id/ {print $3; exit}' /proc/cpuinfo)
+if [[ "$cpu_vendor" == "GenuineIntel" ]]; then
+    UCODE_PKG=(intel-ucode)
+elif [[ "$cpu_vendor" == "AuthenticAMD" ]]; then
+    UCODE_PKG=(amd-ucode)
+fi
+
+# ---------------------------------------------------------------------------
+# 6. Core base system
+# ---------------------------------------------------------------------------
+
 echo "Installing Sona Linux core system and audio stack..."
-pacstrap /mnt \
+pacstrap -K /mnt \
     base \
     base-devel \
     linux \
@@ -281,7 +584,7 @@ pacstrap /mnt \
     linux-firmware \
     sof-firmware \
     alsa-ucm-conf \
-    $UCODE_PKG \
+    "${UCODE_PKG[@]}" \
     sudo \
     git \
     curl \
@@ -311,61 +614,50 @@ pacstrap /mnt \
     xdg-user-dirs \
     xdg-utils
 
-# Export active Wi-Fi credentials directly to a native NetworkManager connection profile
+# Save the Wi-Fi network as a NetworkManager profile so it connects after reboot.
 if [[ -n "$SELECTED_SSID" ]]; then
-    mkdir -p /mnt/etc/NetworkManager/system-connections
-    NM_UUID=$(cat /proc/sys/kernel/random/uuid)
-    if [[ -n "$WIFI_PASS" ]]; then
-        cat > "/mnt/etc/NetworkManager/system-connections/${SELECTED_SSID}.nmconnection" <<NMCONF
-[connection]
-id=$SELECTED_SSID
-uuid=$NM_UUID
-type=wifi
-autoconnect=true
-
-[wifi]
-mode=infrastructure
-ssid=$SELECTED_SSID
-
-[wifi-security]
-key-mgmt=wpa-psk
-psk=$WIFI_PASS
-
-[ipv4]
-method=auto
-
-[ipv6]
-method=auto
-NMCONF
-    else
-        cat > "/mnt/etc/NetworkManager/system-connections/${SELECTED_SSID}.nmconnection" <<NMCONF
-[connection]
-id=$SELECTED_SSID
-uuid=$NM_UUID
-type=wifi
-autoconnect=true
-
-[wifi]
-mode=infrastructure
-ssid=$SELECTED_SSID
-
-[ipv4]
-method=auto
-
-[ipv6]
-method=auto
-NMCONF
-    fi
-    chmod 600 "/mnt/etc/NetworkManager/system-connections/${SELECTED_SSID}.nmconnection"
+    NM_DIR=/mnt/etc/NetworkManager/system-connections
+    NM_FILE="$NM_DIR/sona-wifi.nmconnection"
+    mkdir -p "$NM_DIR"
+    {
+        echo "[connection]"
+        echo "id=$SELECTED_SSID"
+        echo "uuid=$(cat /proc/sys/kernel/random/uuid)"
+        echo "type=wifi"
+        echo "autoconnect=true"
+        echo
+        echo "[wifi]"
+        echo "mode=infrastructure"
+        echo "ssid=$SELECTED_SSID"
+        echo
+        if [[ -n "$WIFI_PASS" ]]; then
+            echo "[wifi-security]"
+            echo "key-mgmt=wpa-psk"
+            echo "psk=$WIFI_PASS"
+            echo
+        fi
+        echo "[ipv4]"
+        echo "method=auto"
+        echo
+        echo "[ipv6]"
+        echo "method=auto"
+    } > "$NM_FILE"
+    chmod 600 "$NM_FILE"
 fi
 
 genfstab -U /mnt > /mnt/etc/fstab
 
-# 7. Pass Configuration into Chroot
-cat > /mnt/root/install.conf <<EOF
+# ---------------------------------------------------------------------------
+# 7. Pass configuration into the chroot
+# ---------------------------------------------------------------------------
+
+(
+    umask 077
+    cat > /mnt/root/install.conf <<EOF
 FULLNAME=$(printf '%q' "$FULLNAME")
 USERNAME=$(printf '%q' "$USERNAME")
 PASSWORD=$(printf '%q' "$PASSWORD")
+ROOT_PASSWORD=$(printf '%q' "$ROOT_PASSWORD")
 HOSTNAME=$(printf '%q' "$HOSTNAME")
 TIMEZONE=$(printf '%q' "$TIMEZONE")
 LANG_LOCALE=$(printf '%q' "$LANG_LOCALE")
@@ -373,17 +665,30 @@ CONSOLE_KEYMAP=$(printf '%q' "$CONSOLE_KEYMAP")
 X11_KEYBOARD=$(printf '%q' "$X11_KEYBOARD")
 DISK=$(printf '%q' "$DISK")
 AUTOLOGIN=$(printf '%q' "$AUTOLOGIN")
+BOOT_MODE=$(printf '%q' "$BOOT_MODE")
+GRUB_REMOVABLE=$(printf '%q' "$GRUB_REMOVABLE")
 EOF
-chmod 600 /mnt/root/install.conf
+)
 
 cat << 'EOF' > /mnt/root/setup-chroot.sh
 #!/bin/bash
-set -euo pipefail
+set -Eeuo pipefail
+
+on_chroot_error() {
+    local rc=$?
+    rm -f /etc/sudoers.d/99-sona-temp-nopasswd
+    echo >&2
+    echo "Error: system setup stopped at line $1 of setup-chroot.sh (exit code $rc)." >&2
+    exit "$rc"
+}
+trap 'on_chroot_error $LINENO' ERR
 
 source /root/install.conf
 
+# The package databases are synced once in step 2; syncing again before
+# every install risks a partial upgrade.
 pac_install() {
-    pacman -Sy --noconfirm --needed "$@"
+    pacman -S --noconfirm --needed "$@"
 }
 
 install_optional() {
@@ -405,9 +710,9 @@ echo "KEYMAP=$CONSOLE_KEYMAP" > /etc/vconsole.conf
 
 # 2. Pacman tuning, multilib (required for Wine), and automatic maintenance timers
 sed -i 's/^#Color/Color/' /etc/pacman.conf
-sed -i 's/^#ParallelDownloads.*/ParallelDownloads = 5/' /etc/pacman.conf
+sed -i 's/^#\?ParallelDownloads.*/ParallelDownloads = 5/' /etc/pacman.conf
 sed -i '/^#\[multilib\]/,/^#Include = \/etc\/pacman.d\/mirrorlist/ s/^#//' /etc/pacman.conf
-pacman -Sy
+pacman -Syu --noconfirm
 
 systemctl enable archlinux-keyring-wkd-sync.timer
 systemctl enable paccache.timer
@@ -430,9 +735,12 @@ BROWSER=google-chrome-stable
 A11Y_ENV
 
 # 5. User accounts and sudoers
-echo "root:$PASSWORD" | chpasswd
-useradd -m -c "$FULLNAME" -G wheel,input,lp,sys -s /bin/bash "$USERNAME"
+echo "root:$ROOT_PASSWORD" | chpasswd
+# The audio group lets this user's PipeWire reach the sound card at boot,
+# before anyone logs in, so console speech works (see step 9).
+useradd -m -c "$FULLNAME" -G wheel,input,lp,sys,audio -s /bin/bash "$USERNAME"
 echo "$USERNAME:$PASSWORD" | chpasswd
+USER_UID=$(id -u "$USERNAME")
 echo "%wheel ALL=(ALL:ALL) ALL" > /etc/sudoers.d/10-wheel
 chmod 0440 /etc/sudoers.d/10-wheel
 
@@ -451,6 +759,51 @@ Server = https://packages.xlibre.net/arch/stable/$arch
 REPO
 fi
 
+# 6b. Community accessibility repositories: Stormux and Jenux.
+# They are added after the official Arch repositories, so official packages
+# always win when both have the same package name. These repos only add
+# packages Arch does not have. Problems here never stop the install.
+
+# Stormux (storm_dragon). Packages are signed. The key is trusted only if
+# it matches this exact fingerprint.
+STORMUX_KEY_FPR="52ADA49000F1FF0456F8AEEFB4CDE1CD56EF8E82"
+STORMUX_KEY_URL="https://git.stormux.org/storm/stormux/raw/branch/master/x86_64/stormux_repo.pub"
+if ! grep -q '^\[stormux\]' /etc/pacman.conf; then
+    if curl -fsSL -o /tmp/stormux_repo.pub "$STORMUX_KEY_URL" \
+        && pacman-key --add /tmp/stormux_repo.pub \
+        && pacman-key --lsign-key "$STORMUX_KEY_FPR"; then
+        cat >> /etc/pacman.conf << 'REPO'
+
+[stormux]
+SigLevel = Required DatabaseOptional
+Server = https://packages.stormux.org/$arch
+REPO
+    else
+        echo "Warning: could not add the Stormux signing key, so the Stormux repository was skipped."
+    fi
+    rm -f /tmp/stormux_repo.pub
+fi
+
+# Jenux (Nash). This repository is unsigned, as in Nash's own pacman.conf,
+# so pacman cannot verify where its packages came from.
+if ! grep -q '^\[jenux\]' /etc/pacman.conf; then
+    cat >> /etc/pacman.conf << 'REPO'
+
+[jenux]
+SigLevel = Optional
+Server = https://repo.jenux.dev
+Server = https://nashcentral.duckdns.org/packages
+REPO
+fi
+
+# If a community server is down, pacman refuses to sync at all. Turn the
+# community repos off in that case instead of failing the whole install.
+if ! pacman -Syy; then
+    echo "Warning: a community repository could not be reached. Disabling the Stormux and Jenux repositories."
+    echo "You can turn them back on later in /etc/pacman.conf."
+    sed -i '/^\[stormux\]/,/^$/ s/^/#/; /^\[jenux\]/,/^$/ s/^/#/' /etc/pacman.conf
+fi
+
 pacman -Syyu --noconfirm --ask 4 xlibre-meta mesa xorg-xinit
 
 mkdir -p /etc/X11/xorg.conf.d
@@ -463,8 +816,15 @@ EndSection
 XKB
 
 # 7. Modern GPU, network, and virtualization driver detection
+pac_install pciutils
 gpu_info=$(lspci -nn | grep -Ei 'VGA|3D|Display' || true)
-if echo "$gpu_info" | grep -qi nvidia; then
+# nvidia-open only supports Turing (RTX 20 / GTX 16) and newer chips:
+# TU1xx, GA1xx, AD1xx, GB2xx, GH1xx. Older cards keep the open-source
+# nouveau driver, which mesa already provides.
+if echo "$gpu_info" | grep -qi nvidia && ! echo "$gpu_info" | grep -Eqi '\b(TU|GA|AD|GB|GH)[0-9]{3}'; then
+    echo "Note: this NVIDIA card is older than RTX 20 / GTX 16. Using the open-source nouveau driver."
+fi
+if echo "$gpu_info" | grep -qi nvidia && echo "$gpu_info" | grep -Eqi '\b(TU|GA|AD|GB|GH)[0-9]{3}'; then
     pac_install nvidia-open nvidia-utils nvidia-settings
     mkdir -p /etc/mkinitcpio.conf.d
     cat > /etc/mkinitcpio.conf.d/nvidia.conf << NVMODS
@@ -485,6 +845,26 @@ if grep -qi microsoft /sys/class/dmi/id/sys_vendor 2>/dev/null; then
     install_optional hyperv
     systemctl enable hv_fcopy_daemon.service hv_kvp_daemon.service hv_vss_daemon.service || true
 fi
+
+# 7b. GRUB boot loader
+# Installed before the desktop and AUR steps, so a later problem cannot
+# leave the computer unable to boot.
+if grep -q '^#\?GRUB_DISABLE_OS_PROBER=' /etc/default/grub; then
+    sed -i 's/^#\?GRUB_DISABLE_OS_PROBER=.*/GRUB_DISABLE_OS_PROBER=false/' /etc/default/grub
+else
+    echo "GRUB_DISABLE_OS_PROBER=false" >> /etc/default/grub
+fi
+
+if [[ "$BOOT_MODE" == "uefi" ]]; then
+    grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=Sona --recheck
+    if [[ "$GRUB_REMOVABLE" == "yes" ]]; then
+        # Fallback copy at EFI/BOOT/BOOTX64.EFI for firmware that loses boot entries.
+        grub-install --target=x86_64-efi --efi-directory=/boot/efi --removable --recheck
+    fi
+else
+    grub-install --target=i386-pc --recheck "$DISK"
+fi
+grub-mkconfig -o /boot/grub/grub.cfg
 
 # 8. MATE desktop, LightDM, and full application suite
 pac_install mate mate-extra lightdm lightdm-gtk-greeter network-manager-applet dconf
@@ -542,12 +922,53 @@ systemctl enable \
     cups.service \
     avahi-daemon.service \
     cronie.service \
-    speech-dispatcher \
     espeakup \
     systemd-timesyncd \
     lightdm
+# speech-dispatcher is not enabled as a system service on purpose: Orca
+# starts its own per-user copy. (The old "systemctl enable speech-dispatcher"
+# line failed because the unit is really named speech-dispatcherd, which
+# stopped the whole install before the boot loader was set up.)
 
 echo "speakup_soft" > /etc/modules-load.d/speakup.conf
+
+# Console speech with PipeWire:
+# espeakup runs as root, but PipeWire runs per user. "Lingering" starts the
+# user's PipeWire at boot, before login, and the drop-in below points root's
+# espeakup at that user's PipeWire socket.
+mkdir -p /var/lib/systemd/linger
+touch "/var/lib/systemd/linger/$USERNAME"
+
+mkdir -p /etc/systemd/system/espeakup.service.d
+cat > /etc/systemd/system/espeakup.service.d/10-sona-pipewire.conf << ESPEAKUP_DROPIN
+[Unit]
+Wants=user@${USER_UID}.service
+After=user@${USER_UID}.service
+
+[Service]
+Environment=PIPEWIRE_RUNTIME_DIR=/run/user/${USER_UID}
+Environment=XDG_RUNTIME_DIR=/run/user/${USER_UID}
+Restart=on-failure
+RestartSec=3
+ESPEAKUP_DROPIN
+
+# Keep the sound card awake so the first words of speech are not cut off.
+mkdir -p /etc/wireplumber/wireplumber.conf.d
+cat > /etc/wireplumber/wireplumber.conf.d/50-sona-no-suspend.conf << WP_NOSUSPEND
+monitor.alsa.rules = [
+  {
+    matches = [
+      { node.name = "~alsa_output.*" }
+      { node.name = "~alsa_input.*" }
+    ]
+    actions = {
+      update-props = {
+        session.suspend-timeout-seconds = 0
+      }
+    }
+  }
+]
+WP_NOSUSPEND
 
 if grep -q '^hosts:' /etc/nsswitch.conf && ! grep -q 'mdns_minimal' /etc/nsswitch.conf; then
     sed -i 's/^hosts: files mymachines/hosts: files mymachines mdns_minimal [NOTFOUND=return]/' /etc/nsswitch.conf
@@ -588,20 +1009,9 @@ session-setup-script=/usr/bin/systemctl stop espeakup.service
 session-cleanup-script=/usr/bin/systemctl start espeakup.service
 HANDOFF
 
-cat > /etc/systemd/system/sona-shutdown-sound.service << SHUTSOUND
-[Unit]
-Description=Sona Linux Shutdown Audio Cue
-DefaultDependencies=no
-Before=shutdown.target reboot.target halt.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/bin/paplay /usr/share/sounds/freedesktop/stereo/service-logout.oga
-
-[Install]
-WantedBy=halt.target reboot.target shutdown.target
-SHUTSOUND
-systemctl enable sona-shutdown-sound.service
+# No separate shutdown sound service: it ran paplay as root, which has no
+# sound server, so it never played. MATE plays the logout sound itself
+# because event sounds are turned on in step 12.
 
 if [[ "$AUTOLOGIN" == "y" ]]; then
     cat > /etc/lightdm/lightdm.conf.d/50-autologin.conf << AUTOCONF
@@ -665,14 +1075,19 @@ DCONF_SETTINGS
 dconf update
 
 # 13. Install yay and AUR packages (Chrome, Pamac, Thorium, RHVoice, OCR tools)
-echo "%wheel ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/99-temp-nopasswd
-su - "$USERNAME" -c "git clone https://aur.archlinux.org/yay-bin.git /tmp/yay-bin && cd /tmp/yay-bin && makepkg -si --noconfirm"
+# AUR problems must never stop the install, so every step here is allowed to fail.
+echo "%wheel ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/99-sona-temp-nopasswd
+chmod 0440 /etc/sudoers.d/99-sona-temp-nopasswd
+if su - "$USERNAME" -c "rm -rf /tmp/yay-bin && git clone https://aur.archlinux.org/yay-bin.git /tmp/yay-bin && cd /tmp/yay-bin && makepkg -si --noconfirm"; then
+    for aur_pkg in google-chrome tgpt-bin pamac-aur thorium-reader-bin ocrmypdf lios-git abcde rhvoice; do
+        su - "$USERNAME" -c "yay -S --noconfirm --needed $aur_pkg" || echo "Warning: AUR package $aur_pkg skipped."
+    done
+else
+    echo "Warning: yay could not be installed, so AUR packages were skipped."
+    echo "You can install them later with: yay -S google-chrome pamac-aur thorium-reader-bin"
+fi
 rm -rf /tmp/yay-bin
-
-for aur_pkg in google-chrome tgpt-bin pamac-aur thorium-reader-bin ocrmypdf lios-git abcde rhvoice; do
-    su - "$USERNAME" -c "yay -S --noconfirm $aur_pkg" || echo "Warning: AUR package $aur_pkg skipped."
-done
-rm -f /etc/sudoers.d/99-temp-nopasswd
+rm -f /etc/sudoers.d/99-sona-temp-nopasswd
 
 # 14. Built-in Sona AI Assistant (Alt+Super+H / Copilot Key)
 cat > /usr/local/bin/sona-ai << 'SONA_AI_SCRIPT'
@@ -967,19 +1382,10 @@ DESKTOP
 cp "/home/$USERNAME/.config/autostart/"*.desktop /etc/skel/.config/autostart/
 chown -R "$USERNAME:$USERNAME" "/home/$USERNAME"
 
-# 19. GRUB bootloader
-if grep -q '^#\?GRUB_DISABLE_OS_PROBER=' /etc/default/grub; then
-    sed -i 's/^#\?GRUB_DISABLE_OS_PROBER=.*/GRUB_DISABLE_OS_PROBER=false/' /etc/default/grub
-else
-    echo "GRUB_DISABLE_OS_PROBER=false" >> /etc/default/grub
-fi
-
-if [[ -d /sys/firmware/efi ]]; then
-    grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB --recheck
-else
-    grub-install --target=i386-pc --recheck "$DISK"
-fi
-grub-mkconfig -o /boot/grub/grub.cfg
+# 19. Refresh the boot menu now that everything is installed, so it also
+# lists Windows or other systems found by os-prober. GRUB itself was
+# installed earlier, so a failure here still leaves a bootable system.
+grub-mkconfig -o /boot/grub/grub.cfg || echo "Warning: could not refresh the GRUB menu. Run grub-mkconfig -o /boot/grub/grub.cfg after reboot."
 EOF
 
 chmod +x /mnt/root/setup-chroot.sh
@@ -990,6 +1396,7 @@ arch-chroot /mnt /root/setup-chroot.sh
 rm -f /mnt/root/setup-chroot.sh /mnt/root/install.conf
 
 umount -R /mnt
+MOUNTED=false
 
 ui_msg "Installation Complete" "Sona Linux has been installed! Remove your installation media and press Enter to reboot."
 reboot

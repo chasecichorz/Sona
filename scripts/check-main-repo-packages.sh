@@ -1,15 +1,27 @@
 #!/usr/bin/env bash
+# Check that every package in the live ISO package list exists in the
+# repositories this machine's pacman knows about. Reports problems only;
+# it never edits the list.
+#
+# Usage: scripts/check-main-repo-packages.sh
+
 set -euo pipefail
 
-PKG_LIST="sona-live/packages.x86_64"
-echo "🔍 Checking all packages in: $PKG_LIST"
-echo
+repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+pkg_list="$repo_dir/sona-live/packages.x86_64"
+missing=0
 
 while read -r pkg; do
-  [[ "$pkg" =~ ^#.*$ || -z "$pkg" ]] && continue
-  if pacman -Si "$pkg" &>/dev/null; then
-    echo "✅ $pkg"
-  else
-    echo "❌ $pkg NOT found in official repos"
-  fi
-done < "$PKG_LIST"
+    [[ -z "$pkg" || "$pkg" == \#* ]] && continue
+    if ! pacman -Si "$pkg" >/dev/null 2>&1; then
+        echo "Missing: $pkg"
+        missing=$((missing + 1))
+    fi
+done < "$pkg_list"
+
+if [[ $missing -eq 0 ]]; then
+    echo "All packages in sona-live/packages.x86_64 were found."
+else
+    echo "$missing package(s) were not found. Run pacman -Sy first if your package lists are old."
+    exit 1
+fi

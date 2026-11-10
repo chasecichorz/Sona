@@ -1,0 +1,5 @@
+# Build output
+work/
+out/
+# Copied in from Install by scripts/build-iso.sh
+sona-live/airootfs/usr/local/bin/sona-install

@@ -1,40 +1,61 @@
-name: Build and Release SONA ISO
+name: Build Sona ISO
+
+# Builds the ISO on every push to main that touches the installer or the
+# ISO profile, and keeps it as a downloadable build artifact for 14 days.
+# Running the workflow by hand (Actions tab, "Run workflow") also publishes
+# the ISO as a GitHub release.
 
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    branches: [main]
+    paths:
+      - Install
+      - sona-live/**
+      - scripts/build-iso.sh
+      - .github/workflows/build-and-release.yml
+
+permissions:
+  contents: write
 
 jobs:
-  build-release:
+  build:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
+    # mkarchiso has to run on Arch Linux, so every step runs inside an
+    # Arch container. Privileged mode lets it mount and build images.
+    container:
+      image: archlinux:latest
+      options: --privileged
+
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
+      - name: Install build tools
+        run: pacman -Syu --noconfirm --needed archiso git
 
-      - name: Set up Arch Linux container
-        uses: docker://archlinux:latest
+      - name: Check out the repository
+        uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Build the ISO
         run: |
-          pacman -Syu --noconfirm archiso git sudo
+          chmod +x scripts/build-iso.sh
+          scripts/build-iso.sh
 
-      - name: Build ISO
-        run: |
-          chmod +x scripts/debug.sh
-          ./scripts/debug.sh
+      - name: Get the build date
+        id: date
+        run: echo "date=$(date +%Y.%m.%d)" >> "$GITHUB_OUTPUT"
 
-      - name: Upload ISO as artifact
-        uses: actions/upload-artifact@v3
+      - name: Upload the ISO as a build artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: sona-iso
+          name: sona-iso-${{ steps.date.outputs.date }}
           path: out/*.iso
+          retention-days: 14
+          if-no-files-found: error
 
-      - name: Create GitHub Release and upload ISO
-        uses: softprops/action-gh-release@v1
+      - name: Publish a release
+        if: github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
         with:
-          tag_name: sona-$(date +'%Y%m%d')
-          name: "SONA Linux $(date +'%Y-%m-%d')"
+          tag_name: sona-${{ steps.date.outputs.date }}-${{ github.run_number }}
+          name: Sona Linux ${{ steps.date.outputs.date }}
           files: out/*.iso
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
