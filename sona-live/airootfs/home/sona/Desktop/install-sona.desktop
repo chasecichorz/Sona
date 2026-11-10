@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Install Sona Linux
+Comment=Install Sona Linux on this computer
+Exec=mate-terminal --title="Install Sona Linux" -x sudo /usr/local/bin/sona-install
+Icon=system-software-install
+Terminal=false

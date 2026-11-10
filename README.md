@@ -8,8 +8,7 @@ with espeakup, XLibre, and a set of accessible everyday apps.
 
 - `Install` - the installer. This is the only installer; edit this file.
 - `sona-live/` - the archiso profile for the Sona live ISO. It is based on
-  Arch Linux's official releng profile. Speech starts on every boot, and the
-  installer is available as the `sona-install` command.
+  Arch Linux's official releng profile.
 - `scripts/build-iso.sh` - builds the ISO into `out/`.
 - `scripts/boot-sona-qemu.sh` - boots the ISO in a QEMU virtual machine with
   sound and a blank 40 GB test disk.
@@ -18,9 +17,23 @@ with espeakup, XLibre, and a set of accessible everyday apps.
 - `.github/workflows/build-and-release.yml` - builds the ISO on GitHub.
 - `docs/` - the project web page.
 
+## The live ISO
+
+The boot menu has two main choices:
+
+- Sona Linux live desktop (the default). Logs in automatically to the MATE
+  desktop with Orca talking. Firefox is included for trying things out. The
+  "Install Sona Linux" icon on the desktop starts the installer.
+- Sona Linux live console with speech. A text console with espeakup, for
+  computers where the desktop does not work. Type `sona-install` to install.
+
+The live desktop uses the standard Arch X server; installed systems use
+XLibre. The live user is `sona`, with no password and full sudo access.
+
 ## Installing
 
-From the Sona live ISO, type `sona-install` and press Enter.
+From the Sona live desktop, open "Install Sona Linux" on the desktop. From
+the live console, type `sona-install` and press Enter.
 
 From a standard Arch Linux ISO, connect to the internet, then run:
 

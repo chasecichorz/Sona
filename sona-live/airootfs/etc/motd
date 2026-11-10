@@ -1,6 +1,9 @@
-Welcome to the Sona Linux live system.
+Welcome to the Sona Linux live console.
 
 To install Sona Linux, type sona-install and press Enter.
 
 For Wi-Fi, the installer will help you connect. You can also connect
 yourself with the iwctl command. Wired connections work automatically.
+
+To try the MATE desktop with Orca instead, restart and choose
+"Sona Linux live desktop" from the boot menu.

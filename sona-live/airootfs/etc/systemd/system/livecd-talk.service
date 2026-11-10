@@ -2,6 +2,7 @@
 Description=Screen reader service
 After=livecd-alsa-unmuter.service
 Before=getty@tty1.service
+ConditionKernelCommandLine=sona.console
 
 [Service]
 Type=oneshot

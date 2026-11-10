@@ -128,3 +128,25 @@ xl2tpd
 zsh
 libnewt
 git
+# --- Sona live desktop ---
+xorg-server
+xf86-video-vesa
+mesa
+mate
+mate-terminal
+lightdm
+lightdm-gtk-greeter
+orca
+speech-dispatcher
+espeak-ng
+pipewire
+pipewire-pulse
+wireplumber
+libcanberra
+sound-theme-freedesktop
+xdg-user-dirs
+xdg-utils
+gvfs
+firefox
+ttf-dejavu
+sudo

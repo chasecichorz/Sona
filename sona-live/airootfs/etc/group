@@ -1,0 +1,4 @@
+root:x:0:root
+wheel:x:998:sona
+autologin:x:1001:sona
+sona:x:1000:

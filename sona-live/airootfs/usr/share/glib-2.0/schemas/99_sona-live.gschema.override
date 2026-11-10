@@ -1,0 +1,9 @@
+[org.mate.interface]
+accessibility=true
+
+[org.gnome.desktop.a11y.applications]
+screen-reader-enabled=true
+
+[org.mate.screensaver]
+idle-activation-enabled=false
+lock-enabled=false

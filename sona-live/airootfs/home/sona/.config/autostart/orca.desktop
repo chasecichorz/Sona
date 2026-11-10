@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Orca
+Exec=orca --replace
+X-GNOME-Autostart-enabled=true
+OnlyShowIn=MATE;

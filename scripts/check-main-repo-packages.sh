@@ -13,7 +13,8 @@ missing=0
 
 while read -r pkg; do
     [[ -z "$pkg" || "$pkg" == \#* ]] && continue
-    if ! pacman -Si "$pkg" >/dev/null 2>&1; then
+    # Accept package groups such as "mate" as well as single packages.
+    if ! pacman -Si "$pkg" >/dev/null 2>&1 && [[ -z "$(pacman -Sgq "$pkg" 2>/dev/null)" ]]; then
         echo "Missing: $pkg"
         missing=$((missing + 1))
     fi
