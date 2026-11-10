@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Sona sound setup
+Exec=/usr/local/bin/sona-session-audio
+X-GNOME-Autostart-enabled=true
+X-MATE-Autostart-Phase=Initialization
+OnlyShowIn=MATE;

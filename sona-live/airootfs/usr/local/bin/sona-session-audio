@@ -1,0 +1,12 @@
+#!/bin/bash
+# Runs at desktop login on the live system. New sound devices start at a
+# quiet 40% in WirePlumber, which can be hard to hear, so raise the output
+# to 70% and make sure it is not muted.
+for _ in $(seq 1 20); do
+    if wpctl inspect @DEFAULT_AUDIO_SINK@ >/dev/null 2>&1; then
+        wpctl set-mute @DEFAULT_AUDIO_SINK@ 0
+        wpctl set-volume @DEFAULT_AUDIO_SINK@ 0.7
+        exit 0
+    fi
+    sleep 0.5
+done

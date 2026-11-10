@@ -25,5 +25,6 @@ file_permissions=(
   ["/usr/local/bin/Installation_guide"]="0:0:755"
   ["/usr/local/bin/livecd-sound"]="0:0:755"
   ["/usr/local/bin/sona-install"]="0:0:755"
+  ["/usr/local/bin/sona-session-audio"]="0:0:755"
   ["/home/sona/Desktop/install-sona.desktop"]="0:0:755"
 )

@@ -14,7 +14,8 @@ with espeakup, XLibre, and a set of accessible everyday apps.
   sound and a blank 40 GB test disk.
 - `scripts/check-main-repo-packages.sh` - checks that every package in the
   ISO package list exists.
-- `.github/workflows/build-and-release.yml` - builds the ISO on GitHub.
+- `.github/workflows/build-and-release.yml` - checks the scripts, builds the
+  ISO on GitHub, and publishes releases (see below).
 - `docs/` - the project web page.
 
 ## The live ISO
@@ -26,6 +27,10 @@ The boot menu has two main choices:
   "Install Sona Linux" icon on the desktop starts the installer.
 - Sona Linux live console with speech. A text console with espeakup, for
   computers where the desktop does not work. Type `sona-install` to install.
+
+While the live desktop loads, the computer says out loud that Sona is
+starting, so the wait is not silent. The volume is raised to 70% at login.
+The desktop has a network icon for Wi-Fi.
 
 The live desktop uses the standard Arch X server; installed systems use
 XLibre. The live user is `sona`, with no password and full sudo access.
@@ -80,3 +85,16 @@ On an Arch Linux system:
     BIOS=1 scripts/boot-sona-qemu.sh   # legacy BIOS
 
 Delete `out/sona-test-disk.qcow2` to start again with a blank test disk.
+
+## Automatic builds
+
+GitHub builds the ISO automatically:
+
+- On every push to main that changes the installer, the ISO profile, or the
+  scripts. The ISO can be downloaded from the run's page in the Actions tab
+  for 14 days.
+- Every Monday, and whenever the workflow is started by hand from the
+  Actions tab. These builds are also published as releases with a SHA-256
+  checksum. Only the 5 newest releases are kept.
+
+Every build first checks all shell scripts with bash and shellcheck.

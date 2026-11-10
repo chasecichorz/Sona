@@ -1,25 +1,69 @@
 name: Build Sona ISO
 
-# Builds the ISO on every push to main that touches the installer or the
-# ISO profile, and keeps it as a downloadable build artifact for 14 days.
-# Running the workflow by hand (Actions tab, "Run workflow") also publishes
-# the ISO as a GitHub release.
+# lint     Checks every shell script for syntax errors and serious bugs.
+# build    Builds the ISO inside an Arch Linux container. The ISO is kept as
+#          a downloadable build artifact for 14 days.
+# release  Publishes the ISO and its SHA-256 checksum as a GitHub release.
+#          Runs on the weekly schedule and when started by hand from the
+#          Actions tab. Only the 5 newest releases are kept.
 
 on:
   workflow_dispatch:
+  schedule:
+    # Every Monday at 06:00 UTC, so the ISO always has recent packages.
+    - cron: "0 6 * * 1"
   push:
     branches: [main]
     paths:
       - Install
       - sona-live/**
-      - scripts/build-iso.sh
+      - scripts/**
+      - .github/workflows/build-and-release.yml
+  pull_request:
+    paths:
+      - Install
+      - sona-live/**
+      - scripts/**
       - .github/workflows/build-and-release.yml
 
 permissions:
   contents: write
 
+# A newer push cancels an older build that is still running.
+concurrency:
+  group: sona-iso-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v5
+
+      - name: Pull the chroot setup script out of the installer
+        run: |
+          # The installer writes setup-chroot.sh from a heredoc; check it too.
+          sed -n "/^cat << 'EOF' > \/mnt\/root\/setup-chroot.sh$/,/^EOF$/p" Install \
+            | sed '1d;$d' > /tmp/setup-chroot.sh
+          test -s /tmp/setup-chroot.sh
+
+      - name: Check shell syntax
+        run: |
+          for f in Install /tmp/setup-chroot.sh scripts/*.sh \
+                   sona-live/profiledef.sh sona-live/airootfs/usr/local/bin/sona-session-audio; do
+            echo "bash -n $f"
+            bash -n "$f"
+          done
+
+      - name: Run shellcheck (errors only)
+        run: |
+          shellcheck --version
+          shellcheck -S error -s bash Install /tmp/setup-chroot.sh scripts/*.sh \
+            sona-live/airootfs/usr/local/bin/sona-session-audio
+
   build:
+    needs: lint
     runs-on: ubuntu-latest
     timeout-minutes: 120
     # mkarchiso has to run on Arch Linux, so every step runs inside an
@@ -27,13 +71,15 @@ jobs:
     container:
       image: archlinux:latest
       options: --privileged
+    outputs:
+      date: ${{ steps.date.outputs.date }}
 
     steps:
       - name: Install build tools
         run: pacman -Syu --noconfirm --needed archiso git
 
       - name: Check out the repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Build the ISO
         run: |
@@ -44,18 +90,71 @@ jobs:
         id: date
         run: echo "date=$(date +%Y.%m.%d)" >> "$GITHUB_OUTPUT"
 
+      - name: Write the checksum
+        run: |
+          cd out
+          sha256sum ./*.iso > SHA256SUMS
+          cat SHA256SUMS
+
       - name: Upload the ISO as a build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sona-iso-${{ steps.date.outputs.date }}
-          path: out/*.iso
+          path: |
+            out/*.iso
+            out/SHA256SUMS
           retention-days: 14
           if-no-files-found: error
+          compression-level: 0
 
-      - name: Publish a release
-        if: github.event_name == 'workflow_dispatch'
-        uses: softprops/action-gh-release@v2
+  release:
+    needs: build
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Download the ISO
+        uses: actions/download-artifact@v8
         with:
-          tag_name: sona-${{ steps.date.outputs.date }}-${{ github.run_number }}
-          name: Sona Linux ${{ steps.date.outputs.date }}
-          files: out/*.iso
+          name: sona-iso-${{ needs.build.outputs.date }}
+          path: out
+
+      - name: Check the ISO fits in a release
+        run: |
+          # GitHub release files must be under 2 GiB.
+          for f in out/*.iso; do
+            size=$(stat -c %s "$f")
+            echo "$f is $((size / 1048576)) MB"
+            if [ "$size" -ge 2147483648 ]; then
+              echo "::error::$f is too large for a GitHub release (2 GiB limit). Download it from the build artifact instead."
+              exit 1
+            fi
+          done
+
+      - name: Publish the release
+        run: |
+          tag="sona-${{ needs.build.outputs.date }}-${{ github.run_number }}"
+          cat > notes.md <<EOF
+          Sona Linux live ISO built on ${{ needs.build.outputs.date }}.
+
+          Boot it and the MATE desktop starts with the Orca screen reader talking.
+          Choose "Sona Linux live console with speech" in the boot menu for a text
+          console with espeakup instead.
+
+          To check the download, put the ISO and SHA256SUMS in one folder and run:
+          sha256sum -c SHA256SUMS
+          EOF
+          gh release create "$tag" out/*.iso out/SHA256SUMS \
+            --title "Sona Linux ${{ needs.build.outputs.date }}" \
+            --notes-file notes.md
+
+      - name: Keep only the 5 newest releases
+        run: |
+          gh release list --limit 100 --json tagName,createdAt \
+            --jq 'sort_by(.createdAt) | reverse | .[5:] | .[].tagName' |
+          while read -r old; do
+            echo "Deleting old release $old"
+            gh release delete "$old" --yes --cleanup-tag
+          done

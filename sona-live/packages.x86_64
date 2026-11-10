@@ -150,3 +150,5 @@ gvfs
 firefox
 ttf-dejavu
 sudo
+networkmanager
+network-manager-applet
