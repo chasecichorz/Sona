@@ -1,0 +1,96 @@
+#!/bin/bash
+# sona-pick-sound: runs once at boot on the live desktop, before the desktop
+# starts, while the sound cards are still free.
+#
+# One sound card:  says that Sona is starting, on that card.
+# Several cards:   on each card in turn, says "press Enter to use this one".
+#                  The chosen card becomes the default for the desktop
+#                  (PipeWire), so Orca talks through the speakers the user
+#                  can actually hear. With no choice, the default is kept.
+#
+# Skip it with the boot option sona.nosoundpick.
+
+set -u
+
+WP_RULE=/etc/wireplumber/wireplumber.conf.d/60-sona-chosen-card.conf
+START_MSG="Sona Linux is starting. The desktop and the Orca screen reader will be ready in about a minute."
+
+grep -qw sona.nosoundpick /proc/cmdline && exit 0
+
+# Cards that can play sound, excluding the PC speaker.
+cards=()
+for dir in /proc/asound/card[0-9]*; do
+    [[ -d "$dir" ]] || continue
+    num="${dir##*card}"
+    [[ "$(cat "$dir/id" 2>/dev/null)" == pcsp ]] && continue
+    compgen -G "$dir/pcm*p" >/dev/null || continue
+    cards+=("$num")
+done
+
+card_name() {
+    # " 0 [A50            ]: USB-Audio - A50"  ->  "A50"
+    sed -n "s/^ *$1 \[[^]]*\]: [^ ]* - //p" /proc/asound/cards | head -n 1
+}
+
+# say CARD TEXT: speak TEXT on one card, in the background.
+say() {
+    espeak-ng -s 165 --stdout "$2" 2>/dev/null | aplay -q -D "plughw:$1,0" 2>/dev/null &
+    SPEAK_PID=$!
+}
+
+if [[ ${#cards[@]} -eq 0 ]]; then
+    exit 0
+fi
+
+if [[ ${#cards[@]} -eq 1 ]]; then
+    say "${cards[0]}" "$START_MSG"
+    wait "$SPEAK_PID" 2>/dev/null
+    exit 0
+fi
+
+# Several cards: ask on each one. The prompts are long enough to finish
+# speaking, plus a few seconds to press Enter.
+chosen=""
+for card in "${cards[@]}"; do
+    name=$(card_name "$card")
+    # Throw away any key presses left over from the previous card.
+    while read -r -t 0.1 -n 1000 _; do :; done
+    say "$card" "Sona Linux is starting. This computer has several sound devices. To hear the screen reader on this one, ${name:-sound card $card}, press Enter now."
+    if read -r -t 14; then
+        chosen="$card"
+        kill "$SPEAK_PID" 2>/dev/null
+        break
+    fi
+    kill "$SPEAK_PID" 2>/dev/null
+    wait "$SPEAK_PID" 2>/dev/null
+done
+
+if [[ -z "$chosen" ]]; then
+    say "${cards[0]}" "No sound device was chosen, so the default will be used. $START_MSG"
+    wait "$SPEAK_PID" 2>/dev/null
+    exit 0
+fi
+
+# Make PipeWire prefer every output on the chosen card.
+mkdir -p "$(dirname "$WP_RULE")"
+cat > "$WP_RULE" <<EOF
+# Written at boot by sona-pick-sound: the user chose card $chosen.
+monitor.alsa.rules = [
+  {
+    matches = [
+      { api.alsa.card = "$chosen", media.class = "Audio/Sink" }
+      { api.alsa.pcm.card = "$chosen", media.class = "Audio/Sink" }
+    ]
+    actions = {
+      update-props = {
+        priority.session = 30000
+        priority.driver = 30000
+      }
+    }
+  }
+]
+EOF
+
+say "$chosen" "This sound device will be used. $START_MSG"
+wait "$SPEAK_PID" 2>/dev/null
+exit 0

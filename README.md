@@ -14,6 +14,8 @@ with espeakup, XLibre, and a set of accessible everyday apps.
   sound and a blank 40 GB test disk.
 - `scripts/check-main-repo-packages.sh` - checks that every package in the
   ISO package list exists.
+- `scripts/ci-install-test.sh` - the automated install test.
+- `examples/unattended-answers.conf` - a sample answer file.
 - `.github/workflows/build-and-release.yml` - checks the scripts, builds the
   ISO on GitHub, and publishes releases (see below).
 - `docs/` - the project web page.
@@ -29,7 +31,10 @@ The boot menu has two main choices:
   computers where the desktop does not work. Type `sona-install` to install.
 
 While the live desktop loads, the computer says out loud that Sona is
-starting, so the wait is not silent. The volume is raised to 70% at login.
+starting, so the wait is not silent. If the computer has more than one sound
+device (for example speakers, a USB headset, and HDMI on a graphics card),
+each device in turn asks you to press Enter to use it. The one you choose is
+where Orca talks. Add `sona.nosoundpick` to the boot options to skip this. The volume is raised to 70% at login.
 The desktop has a network icon for Wi-Fi.
 
 The live desktop uses the standard Arch X server; installed systems use
@@ -56,6 +61,16 @@ confirm. Press Escape on any question to quit.
 - Dual-boot. Choose a partition you already made for Sona from a menu. On
   UEFI computers the existing EFI partition is reused without formatting, and
   the Sona boot loader is added next to the one Windows uses.
+
+### Unattended installs
+
+The installer can run with no questions, using an answer file:
+
+    sona-install --unattended my-answers.conf
+
+Copy `examples/unattended-answers.conf`, fill it in, and set
+`CONFIRM_ERASE=yes`. The installer refuses to touch any disk without it.
+`DISK=auto` only works when the computer has exactly one drive.
 
 ## Package repositories
 
@@ -97,4 +112,13 @@ GitHub builds the ISO automatically:
   Actions tab. These builds are also published as releases with a SHA-256
   checksum. Only the 5 newest releases are kept.
 
-Every build first checks all shell scripts with bash and shellcheck.
+Every build first checks all shell scripts with bash and shellcheck. After
+the ISO is built, `scripts/ci-install-test.sh` boots it in a virtual
+machine, installs Sona with `scripts/ci/answers.conf`, and boots the
+installed system, once with UEFI and once with legacy BIOS. A release is
+only published when both pass. The test logs are saved with each run.
+
+You can run the same test on your own computer:
+
+    sudo pacman -S qemu-desktop edk2-ovmf libarchive
+    scripts/ci-install-test.sh out/sona-*.iso uefi

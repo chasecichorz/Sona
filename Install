@@ -4,6 +4,12 @@
 #
 # Run as root from an Arch Linux live ISO (or the Sona live ISO).
 # Works on both UEFI and legacy BIOS computers.
+#
+# Usage:
+#   Install                          ask every question with menus
+#   Install --unattended FILE        install with no questions, using the
+#                                    answers in FILE (see
+#                                    examples/unattended-answers.conf)
 
 set -Eeuo pipefail
 
@@ -11,6 +17,27 @@ BACKTITLE="Sona Linux Accessible Installer"
 SELECTED_SSID=""
 WIFI_PASS=""
 MOUNTED=false
+UNATTENDED=no
+ANSWER_FILE=""
+declare -A ANS=()
+
+case "${1:-}" in
+    --unattended|--answers)
+        [[ -n "${2:-}" ]] || { echo "Error: $1 needs the path to an answer file." >&2; exit 1; }
+        UNATTENDED=yes
+        ANSWER_FILE="$2"
+        ;;
+    -h|--help)
+        sed -n '2,13p' "$0"
+        exit 0
+        ;;
+    "")
+        ;;
+    *)
+        echo "Error: unknown option $1. Run with --help for usage." >&2
+        exit 1
+        ;;
+esac
 
 # ---------------------------------------------------------------------------
 # Error handling
@@ -56,7 +83,43 @@ user_cancelled() {
 # ---------------------------------------------------------------------------
 
 ui_msg() {
+    if [[ "$UNATTENDED" == yes ]]; then
+        printf '\n== %s\n%s\n' "$1" "$2"
+        return 0
+    fi
     whiptail --backtitle "$BACKTITLE" --title "$1" --msgbox "$2" 14 74
+}
+
+# ---------------------------------------------------------------------------
+# Answer file (unattended mode)
+# One KEY=value per line. Lines starting with # are comments. Values may be
+# wrapped in single or double quotes. The file is read, never run.
+# ---------------------------------------------------------------------------
+
+ANSWER_KEYS=" DISK PART_MODE CONFIRM_ERASE ROOT_PART EFI_PART FULLNAME USERNAME PASSWORD ROOT_PASSWORD HOSTNAME TIMEZONE LANG_LOCALE CONSOLE_KEYMAP X11_KEYBOARD AUTOLOGIN WIFI_SSID WIFI_PASS INSTALL_AUR SERIAL_CONSOLE FINISH "
+
+load_answers() {
+    local file="$1" line key val n=0
+    [[ -r "$file" ]] || err "Cannot read the answer file $file."
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        n=$((n + 1))
+        line="${line%$'\r'}"
+        [[ -z "${line//[[:space:]]/}" || "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" == *=* ]] || err "Answer file line $n is not KEY=value: $line"
+        key="${line%%=*}"
+        key="${key//[[:space:]]/}"
+        val="${line#*=}"
+        if [[ ${#val} -ge 2 && ( ( "${val:0:1}" == '"' && "${val: -1}" == '"' ) || ( "${val:0:1}" == "'" && "${val: -1}" == "'" ) ) ]]; then
+            val="${val:1:${#val}-2}"
+        fi
+        [[ "$ANSWER_KEYS" == *" $key "* ]] || err "Answer file line $n has an unknown setting: $key"
+        ANS[$key]="$val"
+    done < "$file"
+}
+
+# ans KEY [DEFAULT]: the answer for KEY, or DEFAULT when it is not set.
+ans() {
+    printf '%s' "${ANS[$1]:-${2:-}}"
 }
 
 ui_input() {
@@ -95,7 +158,13 @@ ui_yesno() {
 }
 
 # Same as ui_yesno, but No is selected by default. Use for anything destructive.
+# In unattended mode the answer file's CONFIRM_ERASE=yes (checked before any
+# disk is touched) is the confirmation.
 ui_yesno_default_no() {
+    if [[ "$UNATTENDED" == yes ]]; then
+        echo "y"
+        return 0
+    fi
     if whiptail --backtitle "$BACKTITLE" --title "$1" --defaultno --yesno "$2" 14 74; then
         echo "y"
     else
@@ -140,15 +209,23 @@ if [[ $EUID -ne 0 ]]; then
     err "This installer must be run as root."
 fi
 
+if [[ "$UNATTENDED" == yes ]]; then
+    load_answers "$ANSWER_FILE"
+    echo "Unattended install using $ANSWER_FILE"
+fi
+
 # The stock Arch ISO does not include whiptail (package libnewt).
-if ! command -v whiptail >/dev/null 2>&1; then
+# Unattended installs never show menus, so they do not need it.
+if [[ "$UNATTENDED" != yes ]] && ! command -v whiptail >/dev/null 2>&1; then
     echo "Installing whiptail for the installer menus..."
     if ! pacman -Sy --noconfirm --needed libnewt; then
         err "Could not install whiptail. Connect to the internet first (for Wi-Fi run: iwctl station wlan0 connect YOUR-NETWORK), then run the installer again."
     fi
 fi
 
-for cmd in whiptail lsblk sgdisk partprobe udevadm wipefs mkfs.fat mkfs.ext4 pacstrap arch-chroot genfstab findmnt; do
+required_cmds=(lsblk sgdisk partprobe udevadm wipefs mkfs.fat mkfs.ext4 pacstrap arch-chroot genfstab findmnt)
+[[ "$UNATTENDED" == yes ]] || required_cmds+=(whiptail)
+for cmd in "${required_cmds[@]}"; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         err "Required command '$cmd' is missing."
     fi
@@ -172,8 +249,82 @@ Press Enter to continue. You can press Escape on any question to quit before any
 # 2. Network and Wi-Fi setup
 # ---------------------------------------------------------------------------
 
+# Some networks (and QEMU's built-in network) block ping, so fall back to
+# fetching a web page.
 have_internet() {
-    ping -c 1 -W 3 archlinux.org >/dev/null 2>&1 || ping -c 1 -W 3 1.1.1.1 >/dev/null 2>&1
+    ping -c 1 -W 3 archlinux.org >/dev/null 2>&1 \
+        || ping -c 1 -W 3 1.1.1.1 >/dev/null 2>&1 \
+        || curl -fsS --max-time 8 -o /dev/null https://archlinux.org 2>/dev/null
+}
+
+first_wifi_iface() {
+    local dev
+    for dev in /sys/class/net/*; do
+        if [[ -d "$dev/wireless" ]]; then
+            basename "$dev"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Use whichever Wi-Fi service is running: NetworkManager on the live
+# desktop, iwd on the live console or a stock Arch ISO.
+pick_wifi_tool() {
+    if systemctl is-active -q NetworkManager 2>/dev/null && command -v nmcli >/dev/null 2>&1; then
+        WIFI_TOOL="nmcli"
+    elif command -v iwctl >/dev/null 2>&1; then
+        WIFI_TOOL="iwctl"
+        systemctl start iwd 2>/dev/null || true
+    elif command -v nmcli >/dev/null 2>&1; then
+        WIFI_TOOL="nmcli"
+    else
+        err "Neither iwctl nor nmcli is available for Wi-Fi."
+    fi
+}
+
+# Connect to $1 with password $2 (blank for an open network).
+wifi_connect() {
+    local iface="$1" ssid="$2" pass="$3"
+    echo "Connecting to $ssid..."
+    if [[ "$WIFI_TOOL" == "iwctl" ]]; then
+        iwctl station "$iface" scan >/dev/null 2>&1 || true
+        sleep 3
+        if [[ -n "$pass" ]]; then
+            iwctl --passphrase "$pass" station "$iface" connect "$ssid" || true
+        else
+            iwctl station "$iface" connect "$ssid" || true
+        fi
+    else
+        if [[ -n "$pass" ]]; then
+            nmcli dev wifi connect "$ssid" password "$pass" || true
+        else
+            nmcli dev wifi connect "$ssid" || true
+        fi
+    fi
+    sleep 4
+}
+
+setup_network_unattended() {
+    local iface
+    if have_internet; then
+        return 0
+    fi
+    SELECTED_SSID=$(ans WIFI_SSID)
+    WIFI_PASS=$(ans WIFI_PASS)
+    if [[ -n "$SELECTED_SSID" ]]; then
+        iface=$(first_wifi_iface) || err "Answer file sets WIFI_SSID, but no wireless network card was found."
+        rfkill unblock wifi 2>/dev/null || true
+        ip link set "$iface" up 2>/dev/null || true
+        pick_wifi_tool
+        wifi_connect "$iface" "$SELECTED_SSID" "$WIFI_PASS"
+    fi
+    echo "Waiting for the internet connection..."
+    for _ in $(seq 1 30); do
+        have_internet && return 0
+        sleep 2
+    done
+    err "No internet connection. Plug in a network cable, or set WIFI_SSID and WIFI_PASS in the answer file."
 }
 
 setup_network() {
@@ -188,33 +339,12 @@ setup_network() {
         "2" "Ethernet (plugged in with a cable)")
 
     if [[ "$net_type" == "1" ]]; then
-        wifi_iface=""
-        for dev in /sys/class/net/*; do
-            if [[ -d "$dev/wireless" ]]; then
-                wifi_iface=$(basename "$dev")
-                break
-            fi
-        done
-
-        if [[ -z "$wifi_iface" ]]; then
-            err "No wireless network card detected."
-        fi
+        wifi_iface=$(first_wifi_iface) || err "No wireless network card detected."
 
         rfkill unblock wifi 2>/dev/null || true
         ip link set "$wifi_iface" up 2>/dev/null || true
 
-        # Use whichever Wi-Fi service is running: NetworkManager on the live
-        # desktop, iwd on the live console or a stock Arch ISO.
-        if systemctl is-active -q NetworkManager 2>/dev/null && command -v nmcli >/dev/null 2>&1; then
-            WIFI_TOOL="nmcli"
-        elif command -v iwctl >/dev/null 2>&1; then
-            WIFI_TOOL="iwctl"
-            systemctl start iwd 2>/dev/null || true
-        elif command -v nmcli >/dev/null 2>&1; then
-            WIFI_TOOL="nmcli"
-        else
-            err "Neither iwctl nor nmcli is available for Wi-Fi scanning."
-        fi
+        pick_wifi_tool
 
         while true; do
             echo "Scanning for Wi-Fi networks on $wifi_iface..."
@@ -252,22 +382,7 @@ setup_network() {
             SELECTED_SSID="${SSIDS[$((selected_idx - 1))]}"
             WIFI_PASS=$(ui_pass "Wi-Fi Password" "Enter the password for $SELECTED_SSID (leave blank if it is open):")
 
-            echo "Connecting to $SELECTED_SSID..."
-            if [[ "$WIFI_TOOL" == "iwctl" ]]; then
-                if [[ -n "$WIFI_PASS" ]]; then
-                    iwctl --passphrase "$WIFI_PASS" station "$wifi_iface" connect "$SELECTED_SSID" || true
-                else
-                    iwctl station "$wifi_iface" connect "$SELECTED_SSID" || true
-                fi
-            else
-                if [[ -n "$WIFI_PASS" ]]; then
-                    nmcli dev wifi connect "$SELECTED_SSID" password "$WIFI_PASS" || true
-                else
-                    nmcli dev wifi connect "$SELECTED_SSID" || true
-                fi
-            fi
-
-            sleep 4
+            wifi_connect "$wifi_iface" "$SELECTED_SSID" "$WIFI_PASS"
             if have_internet; then
                 break
             fi
@@ -286,7 +401,11 @@ setup_network() {
     fi
 }
 
-setup_network
+if [[ "$UNATTENDED" == yes ]]; then
+    setup_network_unattended
+else
+    setup_network
+fi
 
 echo "Initializing keyring and selecting fast mirrors..."
 sed -i 's/^#\?ParallelDownloads.*/ParallelDownloads = 5/' /etc/pacman.conf
@@ -301,90 +420,106 @@ fi
 # 3. User and system settings
 # ---------------------------------------------------------------------------
 
-FULLNAME=$(ui_input "User Setup" "Enter your full name:" "Sona User")
+valid_username() { [[ "$1" =~ ^[a-z_][a-z0-9_-]{0,31}$ && "$1" != "root" ]]; }
+valid_hostname() { [[ "$1" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; }
+valid_timezone() { [[ -n "$1" && -f "/usr/share/zoneinfo/$1" ]]; }
+valid_locale()   { grep -q "^${1//./\\.} UTF-8" /usr/share/i18n/SUPPORTED 2>/dev/null; }
+yes_or_no()      { case "${1,,}" in y|yes|true|1) echo "y" ;; *) echo "n" ;; esac; }
 
-while true; do
-    USERNAME=$(ui_input "User Setup" "Enter a lowercase username (no spaces):" "sona")
-    USERNAME="${USERNAME,,}"
-    if [[ "$USERNAME" =~ ^[a-z_][a-z0-9_-]{0,31}$ && "$USERNAME" != "root" ]]; then
-        break
-    fi
-    ui_msg "Invalid Username" "The username must start with a letter, be 32 characters or fewer, and use only lowercase letters, numbers, underscores, or hyphens."
-done
-
-while true; do
-    HOSTNAME=$(ui_input "Computer Name" "Enter a name for this computer (hostname):" "sona-pc")
-    HOSTNAME="${HOSTNAME,,}"
-    if [[ "$HOSTNAME" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
-        break
-    fi
-    ui_msg "Invalid Computer Name" "The computer name can use only letters, numbers, and hyphens, and cannot start or end with a hyphen."
-done
-
-while true; do
-    PASSWORD=$(ui_pass "Password Setup" "Enter a password for $USERNAME:")
-    PASS_CONFIRM=$(ui_pass "Password Setup" "Confirm your password:")
-    if [[ -n "$PASSWORD" && "$PASSWORD" == "$PASS_CONFIRM" ]]; then
-        break
-    fi
-    ui_msg "Password Mismatch" "The passwords did not match or were blank. Please try again."
-done
-
-if [[ $(ui_yesno "Administrator Password" "Use the same password for the root (administrator) account?
-
-Choose No to set a separate root password.") == "y" ]]; then
-    ROOT_PASSWORD="$PASSWORD"
+if [[ "$UNATTENDED" == yes ]]; then
+    FULLNAME=$(ans FULLNAME "Sona User")
+    USERNAME=$(ans USERNAME "sona"); USERNAME="${USERNAME,,}"
+    valid_username "$USERNAME" || err "Answer file: USERNAME \"$USERNAME\" is not a valid username."
+    HOSTNAME=$(ans HOSTNAME "sona-pc"); HOSTNAME="${HOSTNAME,,}"
+    valid_hostname "$HOSTNAME" || err "Answer file: HOSTNAME \"$HOSTNAME\" is not a valid computer name."
+    PASSWORD=$(ans PASSWORD)
+    [[ -n "$PASSWORD" ]] || err "Answer file: PASSWORD is required."
+    ROOT_PASSWORD=$(ans ROOT_PASSWORD "$PASSWORD")
+    AUTOLOGIN=$(yes_or_no "$(ans AUTOLOGIN no)")
+    TIMEZONE=$(ans TIMEZONE "UTC")
+    valid_timezone "$TIMEZONE" || err "Answer file: TIMEZONE \"$TIMEZONE\" is not a known time zone."
+    LANG_LOCALE=$(ans LANG_LOCALE "en_US.UTF-8")
+    valid_locale "$LANG_LOCALE" || err "Answer file: LANG_LOCALE \"$LANG_LOCALE\" is not a supported UTF-8 locale."
+    CONSOLE_KEYMAP=$(ans CONSOLE_KEYMAP "us")
+    X11_KEYBOARD=$(ans X11_KEYBOARD "us")
 else
+    FULLNAME=$(ui_input "User Setup" "Enter your full name:" "Sona User")
+
     while true; do
-        ROOT_PASSWORD=$(ui_pass "Root Password" "Enter a password for the root account:")
-        ROOT_CONFIRM=$(ui_pass "Root Password" "Confirm the root password:")
-        if [[ -n "$ROOT_PASSWORD" && "$ROOT_PASSWORD" == "$ROOT_CONFIRM" ]]; then
+        USERNAME=$(ui_input "User Setup" "Enter a lowercase username (no spaces):" "sona")
+        USERNAME="${USERNAME,,}"
+        valid_username "$USERNAME" && break
+        ui_msg "Invalid Username" "The username must start with a letter, be 32 characters or fewer, and use only lowercase letters, numbers, underscores, or hyphens."
+    done
+
+    while true; do
+        HOSTNAME=$(ui_input "Computer Name" "Enter a name for this computer (hostname):" "sona-pc")
+        HOSTNAME="${HOSTNAME,,}"
+        valid_hostname "$HOSTNAME" && break
+        ui_msg "Invalid Computer Name" "The computer name can use only letters, numbers, and hyphens, and cannot start or end with a hyphen."
+    done
+
+    while true; do
+        PASSWORD=$(ui_pass "Password Setup" "Enter a password for $USERNAME:")
+        PASS_CONFIRM=$(ui_pass "Password Setup" "Confirm your password:")
+        if [[ -n "$PASSWORD" && "$PASSWORD" == "$PASS_CONFIRM" ]]; then
             break
         fi
         ui_msg "Password Mismatch" "The passwords did not match or were blank. Please try again."
     done
+
+    if [[ $(ui_yesno "Administrator Password" "Use the same password for the root (administrator) account?
+
+Choose No to set a separate root password.") == "y" ]]; then
+        ROOT_PASSWORD="$PASSWORD"
+    else
+        while true; do
+            ROOT_PASSWORD=$(ui_pass "Root Password" "Enter a password for the root account:")
+            ROOT_CONFIRM=$(ui_pass "Root Password" "Confirm the root password:")
+            if [[ -n "$ROOT_PASSWORD" && "$ROOT_PASSWORD" == "$ROOT_CONFIRM" ]]; then
+                break
+            fi
+            ui_msg "Password Mismatch" "The passwords did not match or were blank. Please try again."
+        done
+    fi
+
+    AUTOLOGIN=$(ui_yesno "Automatic Login" "Log into the MATE desktop automatically on startup without asking for your password?")
+
+    while true; do
+        TZ_CHOICE=$(ui_menu "Time Zone" "Select your time zone:" \
+            "1" "America/New_York (Eastern)" \
+            "2" "America/Chicago (Central)" \
+            "3" "America/Denver (Mountain)" \
+            "4" "America/Phoenix (Arizona)" \
+            "5" "America/Los_Angeles (Pacific)" \
+            "6" "UTC" \
+            "7" "Europe/London" \
+            "8" "Type a time zone")
+
+        case "$TZ_CHOICE" in
+            1) TIMEZONE="America/New_York" ;;
+            2) TIMEZONE="America/Chicago" ;;
+            3) TIMEZONE="America/Denver" ;;
+            4) TIMEZONE="America/Phoenix" ;;
+            5) TIMEZONE="America/Los_Angeles" ;;
+            6) TIMEZONE="UTC" ;;
+            7) TIMEZONE="Europe/London" ;;
+            8) TIMEZONE=$(ui_input "Time Zone" "Enter a full time zone name, for example America/Chicago:" "America/Chicago") ;;
+        esac
+
+        valid_timezone "$TIMEZONE" && break
+        ui_msg "Unknown Time Zone" "\"$TIMEZONE\" is not a known time zone. Please try again."
+    done
+
+    while true; do
+        LANG_LOCALE=$(ui_input "Language Locale" "Confirm the system locale:" "en_US.UTF-8")
+        valid_locale "$LANG_LOCALE" && break
+        ui_msg "Unknown Locale" "\"$LANG_LOCALE\" is not a supported UTF-8 locale. Use a name like en_US.UTF-8 or en_GB.UTF-8."
+    done
+
+    CONSOLE_KEYMAP=$(ui_input "Console Keymap" "Confirm the console keyboard layout:" "us")
+    X11_KEYBOARD=$(ui_input "Desktop Keyboard" "Confirm the desktop keyboard layout:" "us")
 fi
-
-AUTOLOGIN=$(ui_yesno "Automatic Login" "Log into the MATE desktop automatically on startup without asking for your password?")
-
-while true; do
-    TZ_CHOICE=$(ui_menu "Time Zone" "Select your time zone:" \
-        "1" "America/New_York (Eastern)" \
-        "2" "America/Chicago (Central)" \
-        "3" "America/Denver (Mountain)" \
-        "4" "America/Phoenix (Arizona)" \
-        "5" "America/Los_Angeles (Pacific)" \
-        "6" "UTC" \
-        "7" "Europe/London" \
-        "8" "Type a time zone")
-
-    case "$TZ_CHOICE" in
-        1) TIMEZONE="America/New_York" ;;
-        2) TIMEZONE="America/Chicago" ;;
-        3) TIMEZONE="America/Denver" ;;
-        4) TIMEZONE="America/Phoenix" ;;
-        5) TIMEZONE="America/Los_Angeles" ;;
-        6) TIMEZONE="UTC" ;;
-        7) TIMEZONE="Europe/London" ;;
-        8) TIMEZONE=$(ui_input "Time Zone" "Enter a full time zone name, for example America/Chicago:" "America/Chicago") ;;
-    esac
-
-    if [[ -f "/usr/share/zoneinfo/$TIMEZONE" ]]; then
-        break
-    fi
-    ui_msg "Unknown Time Zone" "\"$TIMEZONE\" is not a known time zone. Please try again."
-done
-
-while true; do
-    LANG_LOCALE=$(ui_input "Language Locale" "Confirm the system locale:" "en_US.UTF-8")
-    if grep -q "^${LANG_LOCALE//./\\.} UTF-8" /usr/share/i18n/SUPPORTED 2>/dev/null; then
-        break
-    fi
-    ui_msg "Unknown Locale" "\"$LANG_LOCALE\" is not a supported UTF-8 locale. Use a name like en_US.UTF-8 or en_GB.UTF-8."
-done
-
-CONSOLE_KEYMAP=$(ui_input "Console Keymap" "Confirm the console keyboard layout:" "us")
-X11_KEYBOARD=$(ui_input "Desktop Keyboard" "Confirm the desktop keyboard layout:" "us")
 
 # ---------------------------------------------------------------------------
 # 4. Disk selection and partitioning
@@ -418,13 +553,40 @@ if [[ ${#DISK_NAMES[@]} -eq 0 ]]; then
     err "No storage drives were found to install to."
 fi
 
-disk_idx=$(ui_menu "Select Installation Drive" "Choose the drive to install Sona Linux onto:" "${disk_menu[@]}")
+if [[ "$UNATTENDED" == yes ]]; then
+    want_disk=$(ans DISK)
+    [[ -n "$want_disk" ]] || err "Answer file: DISK is required (a path like /dev/sda, or auto)."
+    if [[ "$want_disk" == "auto" ]]; then
+        # "auto" is only allowed when there is exactly one possible drive,
+        # so an answer file can never pick the wrong one.
+        [[ ${#DISK_NAMES[@]} -eq 1 ]] || err "Answer file: DISK=auto needs exactly one drive, but ${#DISK_NAMES[@]} were found. Set DISK to a path."
+        disk_idx=1
+    else
+        disk_idx=""
+        for i in "${!DISK_NAMES[@]}"; do
+            [[ "${DISK_NAMES[$i]}" == "$want_disk" ]] && disk_idx=$((i + 1))
+        done
+        [[ -n "$disk_idx" ]] || err "Answer file: DISK $want_disk is not an available drive. Available: ${DISK_NAMES[*]}"
+    fi
+else
+    disk_idx=$(ui_menu "Select Installation Drive" "Choose the drive to install Sona Linux onto:" "${disk_menu[@]}")
+fi
 DISK="${DISK_NAMES[$((disk_idx - 1))]}"
 DISK_LABEL="${DISK_DESC[$((disk_idx - 1))]}"
 
-PART_MODE=$(ui_menu "Partitioning Method" "How would you like to install onto $DISK_LABEL?" \
-    "1" "Erase the entire drive and set up Sona Linux automatically" \
-    "2" "Dual-boot: use a partition I already created for Sona")
+if [[ "$UNATTENDED" == yes ]]; then
+    case "$(ans PART_MODE erase)" in
+        erase) PART_MODE=1 ;;
+        existing) PART_MODE=2 ;;
+        *) err "Answer file: PART_MODE must be erase or existing." ;;
+    esac
+    [[ "$(ans CONFIRM_ERASE)" == "yes" ]] || err "Answer file: set CONFIRM_ERASE=yes to confirm that data will be erased on $DISK_LABEL."
+    echo "Installing to $DISK_LABEL (PART_MODE=$(ans PART_MODE erase))"
+else
+    PART_MODE=$(ui_menu "Partitioning Method" "How would you like to install onto $DISK_LABEL?" \
+        "1" "Erase the entire drive and set up Sona Linux automatically" \
+        "2" "Dual-boot: use a partition I already created for Sona")
+fi
 
 EFI_PART=""
 GRUB_REMOVABLE="no"
@@ -453,9 +615,14 @@ if [[ "$PART_MODE" == "2" ]]; then
 
         if [[ ${#ESP_LIST[@]} -eq 0 ]]; then
             err "No EFI system partition was found. Dual-boot on a UEFI computer needs the one Windows or your other system already uses."
+        elif [[ "$UNATTENDED" == yes && -n "$(ans EFI_PART)" ]]; then
+            EFI_PART=$(ans EFI_PART)
+            [[ " ${ESP_LIST[*]} " == *" $EFI_PART "* ]] || err "Answer file: EFI_PART $EFI_PART is not an EFI system partition. Found: ${ESP_LIST[*]}"
         elif [[ ${#ESP_LIST[@]} -eq 1 ]]; then
             EFI_PART="${ESP_LIST[0]}"
             ui_msg "EFI Partition" "Sona will add its boot loader to the existing EFI partition $EFI_PART. It will not be formatted, and your other system's boot files will be kept."
+        elif [[ "$UNATTENDED" == yes ]]; then
+            err "Answer file: several EFI partitions were found (${ESP_LIST[*]}). Set EFI_PART to one of them."
         else
             esp_idx=$(ui_menu "EFI Partition" "Choose the existing EFI partition to add the Sona boot loader to. It will not be formatted:" "${esp_menu[@]}")
             EFI_PART="${ESP_LIST[$((esp_idx - 1))]}"
@@ -492,7 +659,17 @@ if [[ "$PART_MODE" == "2" ]]; then
         err "No usable partitions were found on $DISK. Shrink your other system first to make free space, create a partition for Sona, and run the installer again."
     fi
 
-    root_idx=$(ui_menu "Sona Partition" "Choose the partition to install Sona Linux onto. It will be erased and formatted:" "${root_menu[@]}")
+    if [[ "$UNATTENDED" == yes ]]; then
+        want_root=$(ans ROOT_PART)
+        [[ -n "$want_root" ]] || err "Answer file: PART_MODE=existing needs ROOT_PART."
+        root_idx=""
+        for i in "${!ROOT_LIST[@]}"; do
+            [[ "${ROOT_LIST[$i]}" == "$want_root" ]] && root_idx=$((i + 1))
+        done
+        [[ -n "$root_idx" ]] || err "Answer file: ROOT_PART $want_root is not a usable partition on $DISK. Usable: ${ROOT_LIST[*]}"
+    else
+        root_idx=$(ui_menu "Sona Partition" "Choose the partition to install Sona Linux onto. It will be erased and formatted:" "${root_menu[@]}")
+    fi
     ROOT_PART="${ROOT_LIST[$((root_idx - 1))]}"
     root_fs="${ROOT_FS[$((root_idx - 1))]}"
 
@@ -678,6 +855,8 @@ DISK=$(printf '%q' "$DISK")
 AUTOLOGIN=$(printf '%q' "$AUTOLOGIN")
 BOOT_MODE=$(printf '%q' "$BOOT_MODE")
 GRUB_REMOVABLE=$(printf '%q' "$GRUB_REMOVABLE")
+INSTALL_AUR=$(printf '%q' "$(yes_or_no "$(ans INSTALL_AUR yes)")")
+SERIAL_CONSOLE=$(printf '%q' "$(yes_or_no "$(ans SERIAL_CONSOLE no)")")
 EOF
 )
 
@@ -860,6 +1039,11 @@ fi
 # 7b. GRUB boot loader
 # Installed before the desktop and AUR steps, so a later problem cannot
 # leave the computer unable to boot.
+if [[ "$SERIAL_CONSOLE" == "y" ]]; then
+    # Also send boot messages and a login prompt to the first serial port.
+    # Used by the automated install test; harmless on real hardware.
+    sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="loglevel=4 console=tty0 console=ttyS0,115200"/' /etc/default/grub
+fi
 if grep -q '^#\?GRUB_DISABLE_OS_PROBER=' /etc/default/grub; then
     sed -i 's/^#\?GRUB_DISABLE_OS_PROBER=.*/GRUB_DISABLE_OS_PROBER=false/' /etc/default/grub
 else
@@ -1025,6 +1209,9 @@ HANDOFF
 # because event sounds are turned on in step 12.
 
 if [[ "$AUTOLOGIN" == "y" ]]; then
+    # Arch's LightDM only logs in members of the autologin group automatically.
+    groupadd -rf autologin
+    gpasswd -a "$USERNAME" autologin
     cat > /etc/lightdm/lightdm.conf.d/50-autologin.conf << AUTOCONF
 [Seat:*]
 autologin-user=$USERNAME
@@ -1087,6 +1274,7 @@ dconf update
 
 # 13. Install yay and AUR packages (Chrome, Pamac, Thorium, RHVoice, OCR tools)
 # AUR problems must never stop the install, so every step here is allowed to fail.
+if [[ "$INSTALL_AUR" == "y" ]]; then
 echo "%wheel ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/99-sona-temp-nopasswd
 chmod 0440 /etc/sudoers.d/99-sona-temp-nopasswd
 if su - "$USERNAME" -c "rm -rf /tmp/yay-bin && git clone https://aur.archlinux.org/yay-bin.git /tmp/yay-bin && cd /tmp/yay-bin && makepkg -si --noconfirm"; then
@@ -1099,6 +1287,9 @@ else
 fi
 rm -rf /tmp/yay-bin
 rm -f /etc/sudoers.d/99-sona-temp-nopasswd
+else
+    echo "Skipping AUR packages (INSTALL_AUR=no)."
+fi
 
 # 14. Built-in Sona AI Assistant (Alt+Super+H / Copilot Key)
 cat > /usr/local/bin/sona-ai << 'SONA_AI_SCRIPT'
@@ -1423,6 +1614,16 @@ rm -f /mnt/root/setup-chroot.sh /mnt/root/install.conf
 
 umount -R /mnt
 MOUNTED=false
+
+if [[ "$UNATTENDED" == yes ]]; then
+    case "$(ans FINISH reboot)" in
+        reboot)   echo "Sona Linux has been installed. Rebooting."; reboot ;;
+        poweroff) echo "Sona Linux has been installed. Powering off."; poweroff ;;
+        none)     echo "Sona Linux has been installed." ;;
+        *)        echo "Sona Linux has been installed. (Unknown FINISH value; not rebooting.)" ;;
+    esac
+    exit 0
+fi
 
 ui_msg "Installation Complete" "Sona Linux has been installed! Remove your installation media and press Enter to reboot."
 reboot
