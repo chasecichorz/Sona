@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Sona live welcome
+Exec=/usr/local/bin/sona-live-welcome
+OnlyShowIn=KDE;
+X-KDE-autostart-phase=2

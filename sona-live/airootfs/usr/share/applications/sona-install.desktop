@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Install Sona Linux
+GenericName=Installer
+Comment=Install Sona Linux on this computer (Windows+Alt+I)
+Keywords=install;installer;setup;sona;
+Exec=konsole -p tabtitle="Install Sona Linux" -e sudo /usr/local/bin/sona-install
+Icon=system-software-install
+Terminal=false
+Categories=System;
+X-KDE-Shortcuts=Meta+Alt+I

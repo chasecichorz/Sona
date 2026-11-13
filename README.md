@@ -1,8 +1,12 @@
 # Sona Linux
 
 Sona Linux is an accessible Arch Linux setup for blind and low-vision users.
-It installs the MATE desktop with the Orca screen reader, console speech
-with espeakup, XLibre, and a set of accessible everyday apps.
+It installs the SonicDE desktop (an X11 fork of KDE Plasma) with the Orca
+screen reader, console speech with espeakup, XLibre, and a set of accessible
+everyday apps. The default voice is OpenEVV (ViaVoice / Eloquence), with the
+Kokoro neural voices and espeak-ng also there. Orca Bridge (NVDA Remote
+compatible) and wine-access are set up for every user. Windows XP sounds
+are on unless you say no.
 
 ## What is in this repository
 
@@ -15,7 +19,17 @@ with espeakup, XLibre, and a set of accessible everyday apps.
 - `scripts/check-main-repo-packages.sh` - checks that every package in the
   ISO package list exists.
 - `scripts/ci-install-test.sh` - the automated install test.
+- `scripts/quick-test.sh` - a quick (about 2 minute) test of the system setup.
 - `examples/unattended-answers.conf` - a sample answer file.
+- `orca-bridge/` - Orca Bridge (NVDA Remote-compatible remote access for
+  Orca; Chase's fork of Orca Remote by SerrebiDev, LGPL), installed and
+  approved for every user (see `orca-bridge/README.txt`).
+- `kokoro/` - the Kokoro neural voices, an extra Speech Dispatcher
+  synthesizer that is on the ISO ready to use (see `kokoro/README.txt`).
+- `packages/openevv-git/` - builds OpenEVV (the IBM ViaVoice / Eloquence
+  voice, Sona's default) from source on each computer, and keeps it updated.
+- `xp-theme/` - the optional Windows XP sound theme for SonicDE (see
+  `xp-theme/README.txt`).
 - `.github/workflows/build-and-release.yml` - checks the scripts, builds the
   ISO on GitHub, and publishes releases (see below).
 - `docs/` - the project web page.
@@ -24,7 +38,7 @@ with espeakup, XLibre, and a set of accessible everyday apps.
 
 The boot menu has two main choices:
 
-- Sona Linux live desktop (the default). Logs in automatically to the MATE
+- Sona Linux live desktop (the default). Logs in automatically to the SonicDE
   desktop with Orca talking. Firefox is included for trying things out. The
   "Install Sona Linux" icon on the desktop starts the installer.
 - Sona Linux live console with speech. A text console with espeakup, for
@@ -42,8 +56,10 @@ XLibre. The live user is `sona`, with no password and full sudo access.
 
 ## Installing
 
-From the Sona live desktop, open "Install Sona Linux" on the desktop. From
-the live console, type `sona-install` and press Enter.
+From the Sona live desktop, press Windows+Alt+I, or open the Start menu,
+type "install", and press Enter on "Install Sona Linux". (The live desktop
+says this out loud after it loads; there is also an icon on the desktop.)
+From a terminal or the live console, type `sudo sona-install`.
 
 From a standard Arch Linux ISO, connect to the internet, then run:
 
@@ -52,6 +68,18 @@ From a standard Arch Linux ISO, connect to the internet, then run:
 
 The installer asks its questions first and changes nothing on disk until you
 confirm. Press Escape on any question to quit.
+
+### No internet needed from the Sona ISO
+
+The Sona ISO holds everything an installed system has. Run from it, the
+installer copies the live system to the disk, removes the live-only parts
+(the `sona` live user, the live login and boot setup), and creates your own
+account. This takes minutes and works with no internet. Without internet
+three things wait until the computer is online: system updates, the AUR apps
+(Google Chrome, Pamac, Thorium; Firefox is the browser until then), and the
+OpenEVV voice (espeak-ng speaks until it is built, which happens by itself).
+
+Run from a standard Arch ISO, the installer downloads everything instead.
 
 ### Disk options
 
@@ -72,26 +100,57 @@ Copy `examples/unattended-answers.conf`, fill it in, and set
 `CONFIRM_ERASE=yes`. The installer refuses to touch any disk without it.
 `DISK=auto` only works when the computer has exactly one drive.
 
+### Logging in
+
+Installed systems have no graphical login screen. Speakup (espeakup) talks
+at the text console login on tty1, and as soon as you log in the SonicDE
+desktop starts with Orca. Speakup is turned off while the desktop runs, so
+it never talks over Orca, and comes back when you log off. If you chose
+automatic login, tty1 logs you in by itself. To start the desktop again
+after logging off, type `exit`.
+
 ## Package repositories
 
 Installed systems use the official Arch repositories plus:
 
 - XLibre, for the X display server.
+- SonicDE (github.com/sonicde-arch/stable), for the desktop. Signed. The key
+  is trusted only if it matches fingerprint
+  A85BB166B49A4C58C39125073B87898C73F11DF5.
 - Stormux (packages.stormux.org). Signed. The key is trusted only if it
   matches fingerprint 52ADA49000F1FF0456F8AEEFB4CDE1CD56EF8E82.
 - Jenux (repo.jenux.dev, with nashcentral.duckdns.org as a backup). Unsigned.
 
 The community repositories come after the official ones, so official
 packages win when both have a package with the same name. If a community
-server cannot be reached during install, those repositories are commented
-out in /etc/pacman.conf instead of stopping the install.
+server cannot be reached during install, Stormux and Jenux are commented
+out in /etc/pacman.conf instead of stopping the install. SonicDE is
+required. The live ISO has the same repositories set up.
 
 ## Building the ISO
 
 On an Arch Linux system:
 
-    sudo pacman -S archiso
+    sudo pacman -S archiso python-pip
     sudo scripts/build-iso.sh
+
+The ISO is about 4 GB. The package lists come from the SONA PACKAGES block
+at the top of `Install`, so the ISO and installed systems never drift apart.
+
+## Quick test (about 2 minutes)
+
+    sudo scripts/quick-test.sh
+
+Runs the installer's system setup (everything after the disk is
+partitioned) in a throwaway container on this computer, then checks the
+result: SonicDE, login and Speakup handoff, Orca, Orca Bridge, shortcuts,
+the XP theme, and the repositories. It shares this computer's package cache,
+and keeps a base system in `out/quick/base`, so repeat runs are fast. It does
+not test partitioning or the boot loader; the virtual machine test below
+does. Options: `--copy` (test the "copy the live system" install, using the
+newest ISO in `out/`), `--copy --offline` (the same with no internet),
+`--shell` (look around inside the result), `--keep` (leave it mounted),
+`--fresh` (rebuild the base after changing the package lists).
 
 ## Testing in a virtual machine
 

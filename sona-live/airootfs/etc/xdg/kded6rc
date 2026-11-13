@@ -1,0 +1,7 @@
+# Sona: never open the SonicDE Welcome Center by itself. It took focus
+# from the desktop at first login, so Orca had nothing useful to read.
+[Module-plasma_welcome]
+autoload=false
+
+[Module-kded_plasma_welcome]
+autoload=false

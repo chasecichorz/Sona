@@ -1,0 +1,12 @@
+[Unit]
+Description=Trust the signing keys of Sona's extra package repositories
+Requires=pacman-init.service
+After=pacman-init.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/sona-live-trust-keys
+
+[Install]
+WantedBy=multi-user.target

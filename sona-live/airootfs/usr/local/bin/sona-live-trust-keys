@@ -1,0 +1,17 @@
+#!/bin/bash
+# Live ISO: trust the signing keys of Sona's extra repositories (copies on
+# the ISO in /usr/share/sona/keys), right after pacman-init.service makes
+# the live keyring. Each key is trusted only with its exact fingerprint.
+set -u
+declare -A FPR=(
+    [sonicde-archlinux.asc]=A85BB166B49A4C58C39125073B87898C73F11DF5
+    [xlibre-archlinux.asc]=0C92313001CFCA27627B9098B97F7C613F359424
+    [stormux_repo.pub]=52ADA49000F1FF0456F8AEEFB4CDE1CD56EF8E82
+)
+for file in "${!FPR[@]}"; do
+    key="/usr/share/sona/keys/$file"
+    [[ -f "$key" ]] || { echo "Missing $key"; continue; }
+    pacman-key --add "$key" && pacman-key --lsign-key "${FPR[$file]}" ||
+        echo "Could not trust $file"
+done
+exit 0

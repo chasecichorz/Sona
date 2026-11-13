@@ -1,6 +1,6 @@
 #!/bin/bash
 # Sona Linux Installer
-# Accessible Arch Linux + MATE + XLibre with Debian-style TUI
+# Accessible Arch Linux + SonicDE + XLibre with Debian-style TUI
 #
 # Run as root from an Arch Linux live ISO (or the Sona live ISO).
 # Works on both UEFI and legacy BIOS computers.
@@ -20,6 +20,47 @@ MOUNTED=false
 UNATTENDED=no
 ANSWER_FILE=""
 declare -A ANS=()
+
+# BEGIN SONA PACKAGES
+# Every package Sona installs. scripts/build-iso.sh reads this block too, so
+# the live ISO always holds everything an installed system gets, and the
+# installer can copy it to the disk with no internet.
+SONA_BASE_PKGS=(
+    base base-devel linux linux-headers linux-firmware sof-firmware
+    alsa-ucm-conf sudo git curl wget nano zram-generator pacman-contrib
+    networkmanager bluez bluez-utils grub efibootmgr os-prober
+    espeakup espeak-ng speech-dispatcher orca brltty alsa-utils
+    pipewire pipewire-pulse pipewire-alsa pipewire-jack wireplumber
+    libcanberra sound-theme-freedesktop xdg-user-dirs xdg-utils
+)
+# CPU microcode: the installer picks one; the ISO carries both.
+# shellcheck disable=SC2034  # read by scripts/build-iso.sh
+SONA_UCODE_PKGS=(amd-ucode intel-ucode)
+# The X server (XLibre) and the SonicDE desktop.
+SONA_X_PKGS=(xlibre-meta mesa xorg-xinit)
+SONA_DESKTOP_PKGS=(sonicde-meta dconf pciutils)
+# Apps. A missing one is skipped with a warning instead of stopping the install.
+SONA_APP_PKGS=(
+    terminator kate ark okular gwenview kcalc firefox flatpak wine
+    festival festival-us tesseract tesseract-data-eng poppler simple-scan
+    maim xdotool xclip sox pavucontrol vlc mpv ffmpeg
+    gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav
+    sound-juicer yt-dlp libreoffice-fresh hunspell hunspell-en_us
+    thunderbird ntfs-3g exfatprogs gvfs gvfs-mtp gvfs-smb 7zip unzip unrar
+    cups system-config-printer avahi nss-mdns sane sane-airscan timeshift
+    cronie zenity
+)
+# What the Windows XP theme scripts need.
+SONA_XP_PKGS=(sox python-dbus python-gobject gtk3 libgudev libnotify udisks2 gvfs-gphoto2)
+# What the Kokoro neural voices need (python-pip only to fetch them when
+# installing by download).
+SONA_KOKORO_PKGS=(python-onnxruntime-cpu python-numpy python-soundfile python-pip libpulse)
+# From the Stormux repository: screen reader support for Windows programs in Wine.
+SONA_STORMUX_PKGS=(wine-access)
+# NVIDIA driver (RTX 20 / GTX 16 and newer). On the ISO so it works with no
+# internet; the installer removes it from computers that cannot use it.
+SONA_NVIDIA_PKGS=(nvidia-open nvidia-utils nvidia-settings nvidia-prime)
+# END SONA PACKAGES
 
 case "${1:-}" in
     --unattended|--answers)
@@ -96,7 +137,7 @@ ui_msg() {
 # wrapped in single or double quotes. The file is read, never run.
 # ---------------------------------------------------------------------------
 
-ANSWER_KEYS=" DISK PART_MODE CONFIRM_ERASE ROOT_PART EFI_PART FULLNAME USERNAME PASSWORD ROOT_PASSWORD HOSTNAME TIMEZONE LANG_LOCALE CONSOLE_KEYMAP X11_KEYBOARD AUTOLOGIN WIFI_SSID WIFI_PASS INSTALL_AUR SERIAL_CONSOLE FINISH "
+ANSWER_KEYS=" DISK PART_MODE CONFIRM_ERASE ROOT_PART EFI_PART FULLNAME USERNAME PASSWORD ROOT_PASSWORD HOSTNAME TIMEZONE LANG_LOCALE CONSOLE_KEYMAP X11_KEYBOARD AUTOLOGIN XP_THEME INSTALL_METHOD WIFI_SSID WIFI_PASS INSTALL_AUR SERIAL_CONSOLE FINISH "
 
 load_answers() {
     local file="$1" line key val n=0
@@ -238,6 +279,23 @@ if [[ -d /sys/firmware/efi ]]; then
 else
     BOOT_MODE="bios"
 fi
+
+# How to install:
+#   copy      copy the Sona live system on this ISO to the disk. Fast, and
+#             works with no internet. Used when running from the Sona ISO.
+#   download  download every package (pacstrap). Used from a stock Arch ISO.
+LIVE_IMAGE=/run/archiso/bootmnt/arch/x86_64/airootfs.sfs
+if [[ -f "$LIVE_IMAGE" && -f /usr/share/sona/live-files.txt && -d /usr/share/sona/boot ]]; then
+    INSTALL_METHOD=copy
+else
+    INSTALL_METHOD=download
+fi
+if [[ "$UNATTENDED" == yes && -n "$(ans INSTALL_METHOD)" && "$(ans INSTALL_METHOD)" != auto ]]; then
+    INSTALL_METHOD=$(ans INSTALL_METHOD)
+    [[ "$INSTALL_METHOD" == download || ( "$INSTALL_METHOD" == copy && -f "$LIVE_IMAGE" ) ]] ||
+        err "Answer file: INSTALL_METHOD must be auto, download, or copy (copy only works from the Sona ISO)."
+fi
+ONLINE=y
 
 ui_msg "Welcome" "Welcome to the Sona Linux installer.
 
@@ -401,19 +459,40 @@ setup_network() {
     fi
 }
 
-if [[ "$UNATTENDED" == yes ]]; then
+if [[ "$INSTALL_METHOD" == copy ]] && ! have_internet; then
+    # Copying the live system needs no internet. Without it, updates, AUR
+    # apps, and the OpenEVV voice come later, once the computer is online.
+    if [[ "$UNATTENDED" == yes ]]; then
+        if [[ -n "$(ans WIFI_SSID)" ]]; then
+            setup_network_unattended
+        else
+            ONLINE=n
+        fi
+    elif [[ $(ui_yesno "No Internet" "This computer is not connected to the internet.
+
+Sona can be installed without internet. Updates, extra apps like Google Chrome, and the OpenEVV voice will be added later, once the computer is online.
+
+Connect to the internet now? Choose No to install without it.") == "y" ]]; then
+        setup_network
+    else
+        ONLINE=n
+    fi
+elif [[ "$UNATTENDED" == yes ]]; then
     setup_network_unattended
 else
     setup_network
 fi
+echo "Installing with method: $INSTALL_METHOD, internet: $ONLINE"
 
-echo "Initializing keyring and selecting fast mirrors..."
-sed -i 's/^#\?ParallelDownloads.*/ParallelDownloads = 5/' /etc/pacman.conf
-pacman-key --init
-pacman-key --populate archlinux
-pacman -Sy --noconfirm --needed archlinux-keyring reflector
-if ! reflector --latest 20 --protocol https --sort rate --save /etc/pacman.d/mirrorlist; then
-    echo "Warning: mirror ranking failed. Using the existing mirror list."
+if [[ "$ONLINE" == y ]]; then
+    echo "Initializing keyring and selecting fast mirrors..."
+    sed -i 's/^#\?ParallelDownloads.*/ParallelDownloads = 5/' /etc/pacman.conf
+    pacman-key --init
+    pacman-key --populate archlinux
+    pacman -Sy --noconfirm --needed archlinux-keyring reflector
+    if ! reflector --latest 20 --protocol https --sort rate --save /etc/pacman.d/mirrorlist; then
+        echo "Warning: mirror ranking failed. Using the existing mirror list."
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -436,6 +515,7 @@ if [[ "$UNATTENDED" == yes ]]; then
     [[ -n "$PASSWORD" ]] || err "Answer file: PASSWORD is required."
     ROOT_PASSWORD=$(ans ROOT_PASSWORD "$PASSWORD")
     AUTOLOGIN=$(yes_or_no "$(ans AUTOLOGIN no)")
+    XP_THEME=$(yes_or_no "$(ans XP_THEME yes)")
     TIMEZONE=$(ans TIMEZONE "UTC")
     valid_timezone "$TIMEZONE" || err "Answer file: TIMEZONE \"$TIMEZONE\" is not a known time zone."
     LANG_LOCALE=$(ans LANG_LOCALE "en_US.UTF-8")
@@ -483,7 +563,15 @@ Choose No to set a separate root password.") == "y" ]]; then
         done
     fi
 
-    AUTOLOGIN=$(ui_yesno "Automatic Login" "Log into the MATE desktop automatically on startup without asking for your password?")
+    AUTOLOGIN=$(ui_yesno "Automatic Login" "Log into the SonicDE desktop automatically on startup without asking for your password?
+
+If you choose No, you log in at the talking text console, and the desktop starts with Orca as soon as you have logged in.")
+
+    XP_THEME=$(ui_yesno "Windows XP Sounds" "Make the desktop sound like Windows XP?
+
+This adds the Windows XP startup, logon, logoff, shutdown, window, notification, and USB device sounds, plus AutoPlay and Safely Remove Hardware. The sounds are downloaded from archive.org the first time you log in.
+
+Choose No to keep the standard SonicDE sounds.")
 
     while true; do
         TZ_CHOICE=$(ui_menu "Time Zone" "Select your time zone:" \
@@ -763,44 +851,25 @@ fi
 # 6. Core base system
 # ---------------------------------------------------------------------------
 
-echo "Installing Sona Linux core system and audio stack..."
-pacstrap -K /mnt \
-    base \
-    base-devel \
-    linux \
-    linux-headers \
-    linux-firmware \
-    sof-firmware \
-    alsa-ucm-conf \
-    "${UCODE_PKG[@]}" \
-    sudo \
-    git \
-    curl \
-    wget \
-    nano \
-    zram-generator \
-    pacman-contrib \
-    networkmanager \
-    bluez \
-    bluez-utils \
-    grub \
-    efibootmgr \
-    os-prober \
-    espeakup \
-    espeak-ng \
-    speech-dispatcher \
-    orca \
-    brltty \
-    alsa-utils \
-    pipewire \
-    pipewire-pulse \
-    pipewire-alsa \
-    pipewire-jack \
-    wireplumber \
-    libcanberra \
-    sound-theme-freedesktop \
-    xdg-user-dirs \
-    xdg-utils
+if [[ "$INSTALL_METHOD" == copy ]]; then
+    echo "Copying the Sona live system to the disk..."
+    unsquashfs -f -d /mnt "$LIVE_IMAGE"
+    # The ISO keeps the kernel outside the image; the copies of the kernel
+    # and CPU microcode the image saved are put back in /boot (see
+    # sona-live/airootfs/etc/pacman.d/hooks/sona-keep-boot.hook).
+    mkdir -p /mnt/boot
+    cp /mnt/usr/share/sona/boot/* /mnt/boot/
+    rm -rf /mnt/usr/share/sona/boot
+    # Replace the live system's resolver link with an empty file:
+    # arch-chroot needs a file there to give the new system working DNS,
+    # and NetworkManager writes the real one at first boot.
+    rm -f /mnt/etc/resolv.conf
+    touch /mnt/etc/resolv.conf
+    [[ "$ONLINE" == y ]] && cp /etc/pacman.d/mirrorlist /mnt/etc/pacman.d/mirrorlist
+else
+    echo "Installing Sona Linux core system and audio stack..."
+    pacstrap -K /mnt "${SONA_BASE_PKGS[@]}" "${UCODE_PKG[@]}"
+fi
 
 # Save the Wi-Fi network as a NetworkManager profile so it connects after reboot.
 if [[ -n "$SELECTED_SSID" ]]; then
@@ -853,10 +922,20 @@ CONSOLE_KEYMAP=$(printf '%q' "$CONSOLE_KEYMAP")
 X11_KEYBOARD=$(printf '%q' "$X11_KEYBOARD")
 DISK=$(printf '%q' "$DISK")
 AUTOLOGIN=$(printf '%q' "$AUTOLOGIN")
+XP_THEME=$(printf '%q' "$XP_THEME")
 BOOT_MODE=$(printf '%q' "$BOOT_MODE")
 GRUB_REMOVABLE=$(printf '%q' "$GRUB_REMOVABLE")
 INSTALL_AUR=$(printf '%q' "$(yes_or_no "$(ans INSTALL_AUR yes)")")
 SERIAL_CONSOLE=$(printf '%q' "$(yes_or_no "$(ans SERIAL_CONSOLE no)")")
+INSTALL_METHOD=$(printf '%q' "$INSTALL_METHOD")
+ONLINE=$(printf '%q' "$ONLINE")
+SONA_X_PKGS=($(printf '%q ' "${SONA_X_PKGS[@]}"))
+SONA_DESKTOP_PKGS=($(printf '%q ' "${SONA_DESKTOP_PKGS[@]}"))
+SONA_APP_PKGS=($(printf '%q ' "${SONA_APP_PKGS[@]}"))
+SONA_XP_PKGS=($(printf '%q ' "${SONA_XP_PKGS[@]}"))
+SONA_KOKORO_PKGS=($(printf '%q ' "${SONA_KOKORO_PKGS[@]}"))
+SONA_STORMUX_PKGS=($(printf '%q ' "${SONA_STORMUX_PKGS[@]}"))
+SONA_NVIDIA_PKGS=($(printf '%q ' "${SONA_NVIDIA_PKGS[@]}"))
 EOF
 )
 
@@ -874,22 +953,94 @@ on_chroot_error() {
 trap 'on_chroot_error $LINENO' ERR
 
 source /root/install.conf
+# QUICK_TEST=y is set only by scripts/quick-test.sh, which runs this script
+# in a container with no real disk: the clock and boot loader steps are
+# skipped, everything else runs as in a real install.
+QUICK_TEST="${QUICK_TEST:-n}"
 
-# The package databases are synced once in step 2; syncing again before
-# every install risks a partial upgrade.
+INSTALL_METHOD="${INSTALL_METHOD:-download}"
+ONLINE="${ONLINE:-y}"
+
+# Install what is not installed yet. (After copying the live system nearly
+# everything already is.) The package databases are synced once in step 6;
+# syncing again before every install risks a partial upgrade. Returns 1 if
+# something is missing and there is no internet to get it.
 pac_install() {
-    pacman -S --noconfirm --needed "$@"
+    local missing
+    missing=$(pacman -T "$@" || true)
+    [[ -z "$missing" ]] && return 0
+    if [[ "$ONLINE" != y ]]; then
+        echo "Warning: no internet, so these were not installed:" $missing
+        return 1
+    fi
+    # shellcheck disable=SC2086
+    pacman -S --noconfirm --needed $missing
 }
 
 install_optional() {
     for pkg in "$@"; do
-        pacman -S --noconfirm --needed "$pkg" || echo "Warning: Optional package $pkg skipped."
+        pac_install "$pkg" || echo "Warning: Optional package $pkg skipped."
     done
 }
 
+# Signing keys for the SonicDE and XLibre repositories: the copies on the
+# Sona ISO when there are any (so this works offline), otherwise downloaded.
+# A key is trusted only if it has exactly the expected fingerprint.
+add_repo_key() {
+    local file="$1" url="$2" fpr="$3" tmp=/tmp/sona-repo-key.asc
+    if [[ -f "/usr/share/sona/keys/$file" ]]; then
+        cp "/usr/share/sona/keys/$file" "$tmp" || return 1
+    else
+        curl -fsSL --retry 3 -o "$tmp" "$url" || return 1
+    fi
+    pacman-key --add "$tmp" || { rm -f "$tmp"; return 1; }
+    rm -f "$tmp"
+    pacman-key --finger "$fpr" || return 1
+    pacman-key --lsign-key "$fpr" || return 1
+}
+
+# 0. After copying the live system: turn it into a normal installed system.
+if [[ "$INSTALL_METHOD" == copy ]]; then
+    echo "Removing the live system's own settings..."
+    # Every file the live ISO added on top of its packages (written by
+    # scripts/build-iso.sh). The installer writes the real versions below.
+    while IFS= read -r f; do
+        [[ -n "$f" ]] && rm -f -- "/$f"
+    done < /usr/share/sona/live-files.txt
+    rm -f /usr/share/sona/live-files.txt
+    : > /etc/environment
+    # The live user and its groups.
+    userdel -r sona 2>/dev/null || true
+    groupdel autologin 2>/dev/null || true
+    usermod -s /bin/bash root
+    # Live-only packages. Installed systems have no graphical login manager.
+    for pkg in mkinitcpio-archiso cloud-init lightdm-gtk-greeter lightdm; do
+        pacman -Q "$pkg" >/dev/null 2>&1 && pacman -Rns --noconfirm "$pkg" || true
+    done
+    # This computer gets its own identity and keys, never the ISO's.
+    rm -f /etc/machine-id /var/lib/dbus/machine-id /etc/ssh/ssh_host_*
+    systemd-machine-id-setup
+    rm -rf /etc/pacman.d/gnupg
+    pacman-key --init
+    pacman-key --populate archlinux
+    # The copied pacman.conf already lists Sona's extra repositories, so
+    # their keys must be trusted before the first sync (step 2). A
+    # repository whose key cannot be added is turned off.
+    add_repo_key xlibre-archlinux.asc https://xlibre-arch.github.io/xlibre-archlinux.asc \
+        0C92313001CFCA27627B9098B97F7C613F359424 || sed -i '/^\[xlibre-stable\]/,/^$/ s/^/#/' /etc/pacman.conf
+    add_repo_key sonicde-archlinux.asc https://sonicde-arch.github.io/sonicde-archlinux.asc \
+        A85BB166B49A4C58C39125073B87898C73F11DF5 || sed -i '/^\[sonicde-stable\]/,/^$/ s/^/#/' /etc/pacman.conf
+    add_repo_key stormux_repo.pub https://git.stormux.org/storm/stormux/raw/branch/master/x86_64/stormux_repo.pub \
+        52ADA49000F1FF0456F8AEEFB4CDE1CD56EF8E82 || sed -i '/^\[stormux\]/,/^$/ s/^/#/' /etc/pacman.conf
+    # A normal boot image, without the live ISO's hooks. The console
+    # keyboard layout goes into it, so it is saved first.
+    echo "KEYMAP=$CONSOLE_KEYMAP" > /etc/vconsole.conf
+    mkinitcpio -P
+fi
+
 # 1. Timezone, clock, and locale
 ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
-hwclock --systohc
+[[ "$QUICK_TEST" == "y" ]] || hwclock --systohc
 
 echo "$LANG_LOCALE UTF-8" > /etc/locale.gen
 locale-gen
@@ -902,7 +1053,14 @@ echo "KEYMAP=$CONSOLE_KEYMAP" > /etc/vconsole.conf
 sed -i 's/^#Color/Color/' /etc/pacman.conf
 sed -i 's/^#\?ParallelDownloads.*/ParallelDownloads = 5/' /etc/pacman.conf
 sed -i '/^#\[multilib\]/,/^#Include = \/etc\/pacman.d\/mirrorlist/ s/^#//' /etc/pacman.conf
-pacman -Syu --noconfirm
+if [[ "$ONLINE" == y ]]; then
+    if [[ "$INSTALL_METHOD" == copy ]]; then
+        # The copied system is complete already; updating it is a bonus.
+        pacman -Syu --noconfirm || echo "Warning: could not update the system now. Run: sudo pacman -Syu"
+    else
+        pacman -Syu --noconfirm
+    fi
+fi
 
 systemctl enable archlinux-keyring-wkd-sync.timer
 systemctl enable paccache.timer
@@ -921,7 +1079,6 @@ QT_ACCESSIBILITY=1
 QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1
 ACCESSIBILITY_ENABLED=1
 GNOME_ACCESSIBILITY=1
-BROWSER=google-chrome-stable
 A11Y_ENV
 
 # 5. User accounts and sudoers
@@ -935,11 +1092,8 @@ echo "%wheel ALL=(ALL:ALL) ALL" > /etc/sudoers.d/10-wheel
 chmod 0440 /etc/sudoers.d/10-wheel
 
 # 6. XLibre repository and display server
-curl -fsSLO https://xlibre-arch.github.io/xlibre-archlinux.asc
-pacman-key --add xlibre-archlinux.asc
-pacman-key --finger B97F7C613F359424
-pacman-key --lsign-key B97F7C613F359424
-rm -f xlibre-archlinux.asc
+add_repo_key xlibre-archlinux.asc https://xlibre-arch.github.io/xlibre-archlinux.asc \
+    0C92313001CFCA27627B9098B97F7C613F359424 || { echo "Error: could not add the XLibre signing key." >&2; exit 1; }
 
 if ! grep -q '^\[xlibre-stable\]' /etc/pacman.conf; then
     cat >> /etc/pacman.conf << 'REPO'
@@ -949,29 +1103,42 @@ Server = https://packages.xlibre.net/arch/stable/$arch
 REPO
 fi
 
-# 6b. Community accessibility repositories: Stormux and Jenux.
+# 6b. SonicDE repository (the desktop). Packages are signed, and the key is
+# trusted only if it matches this exact fingerprint from sonicde-arch.github.io.
+SONICDE_KEY_FPR="A85BB166B49A4C58C39125073B87898C73F11DF5"
+SONICDE_KEY_URL="https://sonicde-arch.github.io/sonicde-archlinux.asc"
+add_repo_key sonicde-archlinux.asc "$SONICDE_KEY_URL" "$SONICDE_KEY_FPR" || { echo "Error: could not add the SonicDE signing key." >&2; exit 1; }
+if ! grep -q '^\[sonicde-stable\]' /etc/pacman.conf; then
+    cat >> /etc/pacman.conf << 'REPO'
+
+[sonicde-stable]
+Server = https://github.com/sonicde-arch/stable/releases/download/$arch
+REPO
+fi
+
+# 6c. Community accessibility repositories: Stormux and Jenux.
 # They are added after the official Arch repositories, so official packages
 # always win when both have the same package name. These repos only add
-# packages Arch does not have. Problems here never stop the install.
+# packages Arch does not have. A problem here never stops the install.
 
 # Stormux (storm_dragon). Packages are signed. The key is trusted only if
 # it matches this exact fingerprint.
 STORMUX_KEY_FPR="52ADA49000F1FF0456F8AEEFB4CDE1CD56EF8E82"
 STORMUX_KEY_URL="https://git.stormux.org/storm/stormux/raw/branch/master/x86_64/stormux_repo.pub"
-if ! grep -q '^\[stormux\]' /etc/pacman.conf; then
-    if curl -fsSL -o /tmp/stormux_repo.pub "$STORMUX_KEY_URL" \
-        && pacman-key --add /tmp/stormux_repo.pub \
-        && pacman-key --lsign-key "$STORMUX_KEY_FPR"; then
+# (After copying the live system, [stormux] is already in pacman.conf, but
+# the keyring is new, so the key is always added.)
+if add_repo_key stormux_repo.pub "$STORMUX_KEY_URL" "$STORMUX_KEY_FPR"; then
+    if ! grep -q '^\[stormux\]' /etc/pacman.conf; then
         cat >> /etc/pacman.conf << 'REPO'
 
 [stormux]
 SigLevel = Required DatabaseOptional
 Server = https://packages.stormux.org/$arch
 REPO
-    else
-        echo "Warning: could not add the Stormux signing key, so the Stormux repository was skipped."
     fi
-    rm -f /tmp/stormux_repo.pub
+else
+    echo "Warning: could not add the Stormux signing key, so the Stormux repository was turned off."
+    sed -i '/^\[stormux\]/,/^$/ s/^/#/' /etc/pacman.conf
 fi
 
 # Jenux (Nash). This repository is unsigned, as in Nash's own pacman.conf,
@@ -988,13 +1155,20 @@ fi
 
 # If a community server is down, pacman refuses to sync at all. Turn the
 # community repos off in that case instead of failing the whole install.
-if ! pacman -Syy; then
-    echo "Warning: a community repository could not be reached. Disabling the Stormux and Jenux repositories."
+if [[ "$ONLINE" == y ]] && ! pacman -Syy; then
+    echo "Warning: a community repository could not be reached, so Stormux and Jenux were turned off."
     echo "You can turn them back on later in /etc/pacman.conf."
     sed -i '/^\[stormux\]/,/^$/ s/^/#/; /^\[jenux\]/,/^$/ s/^/#/' /etc/pacman.conf
+    # SonicDE is required for the desktop, so stop here if it is the one failing.
+    pacman -Syy || { echo "Error: the SonicDE or Arch repositories could not be reached." >&2; exit 1; }
 fi
 
-pacman -Syyu --noconfirm --ask 4 xlibre-meta mesa xorg-xinit
+# --ask 4 lets XLibre replace the standard X server without a question.
+if [[ "$ONLINE" == y ]]; then
+    pacman -Syyu --noconfirm --needed --ask 4 "${SONA_X_PKGS[@]}"
+else
+    pac_install "${SONA_X_PKGS[@]}"
+fi
 
 mkdir -p /etc/X11/xorg.conf.d
 cat > /etc/X11/xorg.conf.d/00-keyboard.conf << XKB
@@ -1015,15 +1189,26 @@ if echo "$gpu_info" | grep -qi nvidia && ! echo "$gpu_info" | grep -Eqi '\b(TU|G
     echo "Note: this NVIDIA card is older than RTX 20 / GTX 16. Using the open-source nouveau driver."
 fi
 if echo "$gpu_info" | grep -qi nvidia && echo "$gpu_info" | grep -Eqi '\b(TU|GA|AD|GB|GH)[0-9]{3}'; then
-    pac_install nvidia-open nvidia-utils nvidia-settings
-    mkdir -p /etc/mkinitcpio.conf.d
-    cat > /etc/mkinitcpio.conf.d/nvidia.conf << NVMODS
+    if ! pac_install nvidia-open nvidia-utils nvidia-settings; then
+        echo "The NVIDIA driver will be needed later: sudo pacman -S nvidia-open nvidia-utils nvidia-settings"
+    else
+        mkdir -p /etc/mkinitcpio.conf.d
+        cat > /etc/mkinitcpio.conf.d/nvidia.conf << NVMODS
 MODULES+=(nvidia nvidia_modeset nvidia_uvm nvidia_drm)
 NVMODS
-    mkinitcpio -P
-    if echo "$gpu_info" | grep -Eqi 'Intel|AMD|ATI'; then
-        pac_install nvidia-prime
+        [[ "$QUICK_TEST" == "y" ]] || mkinitcpio -P
+        if echo "$gpu_info" | grep -Eqi 'Intel|AMD|ATI'; then
+            install_optional nvidia-prime
+        else
+            pacman -Q nvidia-prime >/dev/null 2>&1 && pacman -Rns --noconfirm nvidia-prime || true
+        fi
     fi
+elif [[ "$INSTALL_METHOD" == copy ]]; then
+    # The live ISO carries the NVIDIA driver; this computer cannot use it,
+    # and leaving it would keep the open-source nouveau driver turned off.
+    for pkg in nvidia-prime nvidia-settings nvidia-open nvidia-utils; do
+        pacman -Q "$pkg" >/dev/null 2>&1 && pacman -Rns --noconfirm "$pkg" || true
+    done
 fi
 
 net_info=$(lspci | grep -i network || true)
@@ -1050,7 +1235,9 @@ else
     echo "GRUB_DISABLE_OS_PROBER=false" >> /etc/default/grub
 fi
 
-if [[ "$BOOT_MODE" == "uefi" ]]; then
+if [[ "$QUICK_TEST" == "y" ]]; then
+    echo "Quick test: skipping grub-install."
+elif [[ "$BOOT_MODE" == "uefi" ]]; then
     grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=Sona --recheck
     if [[ "$GRUB_REMOVABLE" == "yes" ]]; then
         # Fallback copy at EFI/BOOT/BOOTX64.EFI for firmware that loses boot entries.
@@ -1059,58 +1246,18 @@ if [[ "$BOOT_MODE" == "uefi" ]]; then
 else
     grub-install --target=i386-pc --recheck "$DISK"
 fi
-grub-mkconfig -o /boot/grub/grub.cfg
+[[ "$QUICK_TEST" == "y" ]] || grub-mkconfig -o /boot/grub/grub.cfg
 
-# 8. MATE desktop, LightDM, and full application suite
-pac_install mate mate-extra lightdm lightdm-gtk-greeter network-manager-applet dconf
-
-install_optional \
-    blueman \
-    flatpak \
-    wine \
-    festival \
-    festival-us \
-    tesseract \
-    tesseract-data-eng \
-    poppler \
-    simple-scan \
-    maim \
-    xdotool \
-    xclip \
-    copyq \
-    pavucontrol \
-    vlc \
-    mpv \
-    ffmpeg \
-    gst-plugins-good \
-    gst-plugins-bad \
-    gst-plugins-ugly \
-    gst-libav \
-    sound-juicer \
-    yt-dlp \
-    libreoffice-fresh \
-    hunspell \
-    hunspell-en_us \
-    thunderbird \
-    ntfs-3g \
-    exfatprogs \
-    gvfs \
-    gvfs-mtp \
-    gvfs-smb \
-    7zip \
-    unzip \
-    unrar \
-    cups \
-    system-config-printer \
-    avahi \
-    nss-mdns \
-    sane \
-    sane-airscan \
-    timeshift \
-    cronie \
-    zenity
+# 8. SonicDE desktop and full application suite
+pac_install "${SONA_DESKTOP_PKGS[@]}"
+install_optional "${SONA_APP_PKGS[@]}"
+install_optional "${SONA_KOKORO_PKGS[@]}"
+# wine-access comes from the Stormux repository (skipped if that is off).
+install_optional "${SONA_STORMUX_PKGS[@]}"
 
 # 9. Core services, Printing, Timeshift, Bluetooth, Flathub, and Speech
+# There is no graphical login manager: you log in at the talking text
+# console (or automatically), and the desktop starts from there (step 11).
 systemctl enable \
     NetworkManager \
     bluetooth \
@@ -1118,8 +1265,7 @@ systemctl enable \
     avahi-daemon.service \
     cronie.service \
     espeakup \
-    systemd-timesyncd \
-    lightdm
+    systemd-timesyncd
 # speech-dispatcher is not enabled as a system service on purpose: Orca
 # starts its own per-user copy. (The old "systemctl enable speech-dispatcher"
 # line failed because the unit is really named speech-dispatcherd, which
@@ -1190,91 +1336,107 @@ pref("spacesToolbar.shown", false);
 pref("mail.tabs.autoHide", true);
 TBPREF
 
-# 11. LightDM Greeter, Audio Handoff, and Shutdown Chime
-cat > /etc/lightdm/lightdm-gtk-greeter.conf << GREETER
-[greeter]
-reader = orca
-a11y-states = +reader
-GREETER
-
-mkdir -p /etc/lightdm/lightdm.conf.d
-cat > /etc/lightdm/lightdm.conf.d/40-audio-handoff.conf << HANDOFF
-[Seat:*]
-session-setup-script=/usr/bin/systemctl stop espeakup.service
-session-cleanup-script=/usr/bin/systemctl start espeakup.service
-HANDOFF
-
-# No separate shutdown sound service: it ran paplay as root, which has no
-# sound server, so it never played. MATE plays the logout sound itself
-# because event sounds are turned on in step 12.
+# 11. Login: talking console on tty1, then SonicDE with Orca.
+# Speakup (espeakup) talks at the console login. When you log in on tty1,
+# ~/.bash_profile stops espeakup so it never talks over Orca, starts the
+# desktop, and starts espeakup again when the desktop closes.
+echo "%wheel ALL=(root) NOPASSWD: /usr/bin/systemctl stop espeakup.service, /usr/bin/systemctl start espeakup.service" > /etc/sudoers.d/20-sona-espeakup
+chmod 0440 /etc/sudoers.d/20-sona-espeakup
 
 if [[ "$AUTOLOGIN" == "y" ]]; then
-    # Arch's LightDM only logs in members of the autologin group automatically.
-    groupadd -rf autologin
-    gpasswd -a "$USERNAME" autologin
-    cat > /etc/lightdm/lightdm.conf.d/50-autologin.conf << AUTOCONF
-[Seat:*]
-autologin-user=$USERNAME
-autologin-session=mate
-AUTOCONF
+    # -f in -o is required: without it login still asks for the password.
+    mkdir -p /etc/systemd/system/getty@tty1.service.d
+    {
+        echo "[Service]"
+        echo "ExecStart="
+        printf '%s\n' "ExecStart=-/sbin/agetty -o '-p -f -- \\\\u' --noclear --autologin $USERNAME %I \$TERM"
+    } > /etc/systemd/system/getty@tty1.service.d/10-sona-autologin.conf
 fi
 
-# 12. System-wide MATE accessibility, Windows 2000 Redmond layout, and keybindings (including Copilot key)
-mkdir -p /etc/dconf/profile /etc/dconf/db/local.d
-cat > /etc/dconf/profile/user << DCONF_PROF
-user-db:user
-system-db:local
-DCONF_PROF
+write_login_files() {
+    local home="$1"
+    cat > "$home/.bash_profile" << 'BASH_PROFILE'
+#
+# ~/.bash_profile
+#
 
-cat > /etc/dconf/db/local.d/00-sona-a11y << DCONF_SETTINGS
-[org/mate/desktop/interface]
-accessibility=true
+[[ -f ~/.bashrc ]] && . ~/.bashrc
 
-[org/gnome/desktop/a11y/applications]
-screen-reader-enabled=true
+# Sona Linux: start the SonicDE desktop after logging in on tty1.
+# Speakup (espeakup) is stopped first so it never talks over Orca, and
+# started again when the desktop closes, leaving a talking console.
+if [ -z "$DISPLAY" ] && [ "$XDG_VTNR" = 1 ]; then
+  sudo -n systemctl stop espeakup.service
+  startx -- -keeptty >~/.xorg-startx.log 2>&1
+  sudo -n systemctl start espeakup.service
+fi
+BASH_PROFILE
 
-[org/mate/panel/general]
-default-layout='redmond'
+    cat > "$home/.xinitrc" << 'XINITRC'
+#!/bin/sh
+# Sona Linux: start SonicDE (run by startx from ~/.bash_profile).
+if [ -d /etc/X11/xinit/xinitrc.d ]; then
+  for f in /etc/X11/xinit/xinitrc.d/?*.sh; do
+    [ -r "$f" ] && . "$f"
+  done
+  unset f
+fi
+[ -f "$HOME/.xprofile" ] && . "$HOME/.xprofile"
+export XDG_CURRENT_DESKTOP=KDE XDG_SESSION_DESKTOP=KDE DESKTOP_SESSION=sonicde
+exec /usr/bin/startplasma-x11
+XINITRC
+    chmod 755 "$home/.xinitrc"
+}
+write_login_files /etc/skel
+write_login_files "/home/$USERNAME"
 
-[org/mate/desktop/sound]
-event-sounds=true
-input-feedback-sounds=true
-theme-name='freedesktop'
+# 12. SonicDE accessibility and keyboard shortcuts
+# Orca starts with every SonicDE session.
+mkdir -p /etc/xdg/autostart
+cat > /etc/xdg/autostart/sona-orca.desktop << ORCA_AUTOSTART
+[Desktop Entry]
+Type=Application
+Name=Orca screen reader
+Exec=orca --replace
+OnlyShowIn=KDE;
+X-KDE-autostart-phase=1
+ORCA_AUTOSTART
 
-[org/mate/caja/desktop]
-computer-icon-visible=true
-home-icon-visible=true
-trash-icon-visible=true
-volumes-visible=true
-network-icon-visible=false
+# Never open the SonicDE Welcome Center by itself: it takes focus from the
+# desktop at first login, so Orca has nothing useful to read.
+cat > /etc/xdg/kded6rc << KDED_RC
+[Module-plasma_welcome]
+autoload=false
 
-[org/mate/caja/preferences]
-default-folder-viewer='list-view'
-sort-directories-first=true
+[Module-kded_plasma_welcome]
+autoload=false
+KDED_RC
+cat > /etc/xdg/plasma-welcomerc << WELCOME_RC
+[General]
+LastSeenVersion=99.0.0
+WELCOME_RC
 
-[org/mate/marco/global-keybindings]
-panel-main-menu='Super_L'
-run-command-1='<Alt><Mod4>s'
-run-command-2='<Alt><Mod4>h'
-run-command-3='<Alt><Mod4>o'
-run-command-4='<Mod4>v'
-run-command-5='<Shift><Mod4>F23'
-run-command-6='<Shift><Mod4>XF86TouchpadOff'
-
-[org/mate/marco/keybinding-commands]
-command-1='orca --replace'
-command-2='mate-terminal --title="Sona AI Assistant" -e /usr/local/bin/sona-ai'
-command-3='/usr/local/bin/sona-ocr'
-command-4='copyq toggle'
-command-5='mate-terminal --title="Sona AI Assistant" -e /usr/local/bin/sona-ai'
-command-6='mate-terminal --title="Sona AI Assistant" -e /usr/local/bin/sona-ai'
-DCONF_SETTINGS
-
-dconf update
+# Keyboard shortcuts come from X-KDE-Shortcuts in these menu files.
+# Meta (Windows key) and Alt+F1 open the Start menu, and Meta+V opens
+# clipboard history (Klipper); both are SonicDE defaults.
+cat > /usr/share/applications/sona-orca-restart.desktop << ORCA_RESTART
+[Desktop Entry]
+Type=Application
+Name=Restart Orca
+Comment=Restart the Orca screen reader (Alt+Windows+S)
+Exec=orca --replace
+Icon=orca
+Terminal=false
+Categories=Utility;Accessibility;
+X-KDE-Shortcuts=Meta+Alt+S
+ORCA_RESTART
 
 # 13. Install yay and AUR packages (Chrome, Pamac, Thorium, RHVoice, OCR tools)
 # AUR problems must never stop the install, so every step here is allowed to fail.
-if [[ "$INSTALL_AUR" == "y" ]]; then
+if [[ "$INSTALL_AUR" == "y" && "$ONLINE" != y ]]; then
+    echo "No internet: skipping AUR apps (Google Chrome, Pamac, Thorium, RHVoice). Firefox is the web browser."
+    echo "Install them later with: yay -S google-chrome pamac-aur thorium-reader-bin rhvoice"
+elif [[ "$INSTALL_AUR" == "y" ]]; then
 echo "%wheel ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/99-sona-temp-nopasswd
 chmod 0440 /etc/sudoers.d/99-sona-temp-nopasswd
 if su - "$USERNAME" -c "rm -rf /tmp/yay-bin && git clone https://aur.archlinux.org/yay-bin.git /tmp/yay-bin && cd /tmp/yay-bin && makepkg -si --noconfirm"; then
@@ -1296,11 +1458,11 @@ cat > /usr/local/bin/sona-ai << 'SONA_AI_SCRIPT'
 #!/bin/bash
 echo "====================================================="
 echo " Welcome to the Sona Linux AI Assistant"
-echo " Type any question about Sona Linux, MATE, or Orca."
+echo " Type any question about Sona Linux, SonicDE, or Orca."
 echo " Type 'exit' or press Ctrl+C to close."
 echo "====================================================="
 
-SYS_PROMPT="You are the built-in helper for Sona Linux, an accessible Arch Linux distribution for blind users running the MATE desktop (configured in the Windows 2000 Redmond layout), XLibre, and the Orca screen reader. Pressing the Windows (Super) key or Alt+F1 opens the classic vertical Start menu. All main apps are also right on the Desktop (Alt+Ctrl+D): Google Chrome, Thunderbird Email (3-pane QuickMail layout using F6/Shift+F6), Add or Remove Software (Pamac), Word Processor (LibreOffice), Thorium Book Reader, VLC Media Player, Instant Screen OCR (Alt+Super+O), Clipboard History (Super+V), and System Restore (Timeshift). Keep answers concise, plain-text, and focused on keyboard shortcuts."
+SYS_PROMPT="You are the built-in helper for Sona Linux, an accessible Arch Linux distribution for blind users running the SonicDE desktop (an X11 fork of KDE Plasma), XLibre, and the Orca screen reader. Pressing the Windows (Super) key or Alt+F1 opens the Start menu. All main apps are also right on the Desktop: the web browser (Google Chrome or Firefox), Thunderbird Email (3-pane QuickMail layout using F6/Shift+F6), Add or Remove Software (Pamac), Word Processor (LibreOffice), Thorium Book Reader, VLC Media Player, Instant Screen OCR (Alt+Super+O), Clipboard History (Super+V), and System Restore (Timeshift). Files opens with Super+E and the terminal with Ctrl+Alt+T. Keep answers concise, plain-text, and focused on keyboard shortcuts."
 
 while true; do
     printf "\nAsk Sona: "
@@ -1317,15 +1479,18 @@ done
 SONA_AI_SCRIPT
 chmod +x /usr/local/bin/sona-ai
 
+# Shift+Meta+F23 is the Copilot key; Shift+Meta+XF86TouchpadOff is what
+# some laptops send for it.
 cat > /usr/share/applications/sona-ai.desktop << SONA_AI_DESKTOP
 [Desktop Entry]
 Type=Application
 Name=Sona AI Assistant
 Comment=Ask questions and get help using Sona Linux
-Exec=mate-terminal --title="Sona AI Assistant" -e /usr/local/bin/sona-ai
+Exec=konsole -p tabtitle="Sona AI Assistant" -e /usr/local/bin/sona-ai
 Icon=utilities-terminal
 Terminal=false
 Categories=Utility;Accessibility;
+X-KDE-Shortcuts=Meta+Alt+H,Meta+Shift+F23,Meta+Shift+TouchpadOff
 SONA_AI_DESKTOP
 
 # 15. NVDA-Style Instant Window OCR Tool (Alt+Super+O)
@@ -1365,20 +1530,30 @@ Exec=/usr/local/bin/sona-ocr
 Icon=scanner
 Terminal=false
 Categories=Utility;Accessibility;
+X-KDE-Shortcuts=Meta+Alt+O
 SONA_OCR_DESKTOP
 
 # 16. Populate Desktop Icons for User and /etc/skel (Ready for Live ISO too)
+# Google Chrome comes from the AUR (step 13). Without it (no internet, or
+# the AUR step skipped), Firefox is the web browser.
+if pacman -Q google-chrome >/dev/null 2>&1; then
+    BROWSER_NAME="Google Chrome" BROWSER_CMD=google-chrome-stable BROWSER_ICON=google-chrome BROWSER_APP=google-chrome.desktop
+else
+    BROWSER_NAME="Firefox" BROWSER_CMD=firefox BROWSER_ICON=firefox BROWSER_APP=firefox.desktop
+fi
+echo "BROWSER=$BROWSER_CMD" >> /etc/environment
+
 create_desktop_shortcuts() {
     local target_dir="$1"
     mkdir -p "$target_dir"
 
-    cat > "$target_dir/Google Chrome.desktop" << 'EOF_ICON'
+    cat > "$target_dir/$BROWSER_NAME.desktop" << EOF_ICON
 [Desktop Entry]
 Type=Application
-Name=Google Chrome
+Name=$BROWSER_NAME
 Comment=Browse the web
-Exec=google-chrome-stable %U
-Icon=google-chrome
+Exec=$BROWSER_CMD %U
+Icon=$BROWSER_ICON
 Terminal=false
 EOF_ICON
 
@@ -1407,7 +1582,7 @@ EOF_ICON
 Type=Application
 Name=Sona AI Assistant
 Comment=Ask questions about Sona Linux and Orca shortcuts (Alt+Super+H)
-Exec=mate-terminal --title="Sona AI Assistant" -e /usr/local/bin/sona-ai
+Exec=konsole -p tabtitle="Sona AI Assistant" -e /usr/local/bin/sona-ai
 Icon=utilities-terminal
 Terminal=false
 EOF_ICON
@@ -1497,7 +1672,7 @@ EOF_ICON
 Type=Application
 Name=Bluetooth Devices
 Comment=Pair and manage Bluetooth speakers, headphones, and keyboards
-Exec=blueman-manager
+Exec=systemsettings kcm_bluetooth
 Icon=bluetooth
 Terminal=false
 EOF_ICON
@@ -1518,36 +1693,96 @@ EOF_ICON
 create_desktop_shortcuts "/home/$USERNAME/Desktop"
 create_desktop_shortcuts "/etc/skel/Desktop"
 
-# 17. Set Google Chrome and Thunderbird as default applications
+# 17. Set the web browser (Chrome or Firefox) and Thunderbird as default applications
 mkdir -p /etc/xdg "/home/$USERNAME/.config"
 cat > /etc/xdg/mimeapps.list << MIMEAPPS
 [Default Applications]
-text/html=google-chrome.desktop
-x-scheme-handler/http=google-chrome.desktop
-x-scheme-handler/https=google-chrome.desktop
-x-scheme-handler/about=google-chrome.desktop
-x-scheme-handler/unknown=google-chrome.desktop
+text/html=$BROWSER_APP
+x-scheme-handler/http=$BROWSER_APP
+x-scheme-handler/https=$BROWSER_APP
+x-scheme-handler/about=$BROWSER_APP
+x-scheme-handler/unknown=$BROWSER_APP
 x-scheme-handler/mailto=thunderbird.desktop
 message/rfc822=thunderbird.desktop
 
 [Added Associations]
-text/html=google-chrome.desktop;
-x-scheme-handler/http=google-chrome.desktop;
-x-scheme-handler/https=google-chrome.desktop;
+text/html=$BROWSER_APP;
+x-scheme-handler/http=$BROWSER_APP;
+x-scheme-handler/https=$BROWSER_APP;
 x-scheme-handler/mailto=thunderbird.desktop;
 message/rfc822=thunderbird.desktop;
 MIMEAPPS
 
 cp /etc/xdg/mimeapps.list "/home/$USERNAME/.config/mimeapps.list"
 
-# 18. Autostart Orca, CopyQ, Desktop Icon Trust Helper, and Login Sound
+# 18. First-login helper: desktop icons, volume, login sound, XP theme
+if [[ "$XP_THEME" == "y" && -d /root/sona-extras/xp-theme ]]; then
+    # Packages the Windows XP sound scripts need. The sounds themselves are
+    # downloaded from archive.org at first login (see sona-session-init).
+    install_optional "${SONA_XP_PKGS[@]}"
+    mkdir -p /usr/share/sona /etc/sona
+    rm -rf /usr/share/sona/xp-theme
+    cp -r /root/sona-extras/xp-theme /usr/share/sona/xp-theme
+    find /usr/share/sona/xp-theme -name '*.sh' -exec chmod 755 {} +
+    install -m755 /usr/share/sona/xp-theme/sona-xp-firstrun /usr/local/bin/sona-xp-firstrun
+    # Sounds included in a private build of the ISO (never in public builds).
+    if [[ -d /root/sona-extras/xp-sounds ]]; then
+        rm -rf /usr/share/sona/xp-sounds
+        cp -r /root/sona-extras/xp-sounds /usr/share/sona/xp-sounds
+    fi
+    touch /etc/sona/xp-theme
+fi
+
+# Orca extensions, installed and approved for this user and for every user
+# made later (/etc/skel): Orca Bridge (NVDA Remote-compatible remote
+# access) and wine-access (Windows programs in Wine, if it is installed).
+if [[ -f /root/sona-extras/orca-bridge/remote.orca-ext ]]; then
+    mkdir -p /usr/share/sona
+    rm -rf /usr/share/sona/orca-bridge
+    cp -r /root/sona-extras/orca-bridge /usr/share/sona/orca-bridge
+    install -m755 /usr/share/sona/orca-bridge/sona-orca-extensions /usr/local/bin/sona-orca-extensions
+    sona-orca-extensions /etc/skel || echo "Warning: the Orca extensions could not be set up in /etc/skel."
+    sona-orca-extensions "/home/$USERNAME" "$USERNAME" || echo "Warning: the Orca extensions could not be set up for $USERNAME."
+fi
+
+# Kokoro neural voices, an extra Speech Dispatcher synthesizer
+# ("kokoro-generic"). On the Sona ISO the model is already in
+# /opt/kokoro-speechd; otherwise it is downloaded now (about 350 MB).
+if [[ -x /root/sona-extras/kokoro/sona-kokoro-setup ]]; then
+    mkdir -p /usr/share/sona
+    rm -rf /usr/share/sona/kokoro
+    cp -r /root/sona-extras/kokoro /usr/share/sona/kokoro
+    install -m755 /usr/share/sona/kokoro/sona-kokoro-setup /usr/local/bin/sona-kokoro-setup
+    sona-kokoro-setup || echo "Warning: Kokoro voices could not be set up now. Run: sudo sona-kokoro-setup"
+fi
+
+# OpenEVV (IBM ViaVoice / Eloquence), the default voice. Its language data
+# is IBM's, so it is built here from source rather than shipped. The timer
+# retries at every boot until it works (for installs with no internet) and
+# then checks for updates weekly.
+if [[ -f /root/sona-extras/packages/openevv-git/PKGBUILD ]]; then
+    mkdir -p /usr/share/sona/packages
+    rm -rf /usr/share/sona/packages/openevv-git
+    cp -r /root/sona-extras/packages/openevv-git /usr/share/sona/packages/openevv-git
+    install -m755 /usr/share/sona/packages/openevv-git/sona-openevv-update /usr/local/bin/sona-openevv-update
+    install -m644 /usr/share/sona/packages/openevv-git/sona-openevv-update.service \
+        /usr/share/sona/packages/openevv-git/sona-openevv-update.timer /etc/systemd/system/
+    systemctl enable sona-openevv-update.timer
+    sona-openevv-update || echo "Warning: OpenEVV could not be built now. It will be built automatically once this computer is online."
+fi
+rm -rf /root/sona-extras
+
 cat > /usr/local/bin/sona-session-init << 'SESSION_INIT'
 #!/bin/bash
 for f in "$HOME"/Desktop/*.desktop; do
     [[ -f "$f" ]] || continue
     chmod +x "$f" 2>/dev/null || true
-    gio set "$f" metadata::trusted true 2>/dev/null || true
 done
+# Keep Sona's Orca extensions (Orca Bridge, wine-access) approved, for
+# example after a package update changed their files.
+if [[ -x /usr/local/bin/sona-orca-extensions ]]; then
+    /usr/local/bin/sona-orca-extensions --refresh >/dev/null 2>&1 &
+fi
 # First login only: new sound devices start at a quiet 40% in WirePlumber,
 # so raise the output to 70% and unmute it. Later logins keep whatever
 # volume the user chose.
@@ -1563,49 +1798,75 @@ if [[ ! -f "$HOME/.config/sona/volume-set" ]]; then
         sleep 0.5
     done
 fi
+# Windows XP theme, if chosen during install: set up once, in the
+# background (it may need to wait for the internet to download the sounds).
+# The XP helpers play their own startup and logon sounds from then on.
+if [[ -f /etc/sona/xp-theme && -x /usr/local/bin/sona-xp-firstrun ]]; then
+    if [[ ! -f "$HOME/.config/sona/xp-theme-installed" ]]; then
+        /usr/local/bin/sona-xp-firstrun >/dev/null 2>&1 &
+        paplay /usr/share/sounds/freedesktop/stereo/service-login.oga 2>/dev/null &
+    fi
+    exit 0
+fi
 paplay /usr/share/sounds/freedesktop/stereo/service-login.oga 2>/dev/null &
 SESSION_INIT
 chmod +x /usr/local/bin/sona-session-init
 
-mkdir -p "/home/$USERNAME/.config/autostart" /etc/skel/.config/autostart
-
-cat > "/home/$USERNAME/.config/autostart/orca.desktop" << DESKTOP
-[Desktop Entry]
-Type=Application
-Name=Orca
-Exec=orca
-X-GNOME-Autostart-enabled=true
-OnlyShowIn=MATE;
-DESKTOP
-
-cat > "/home/$USERNAME/.config/autostart/copyq.desktop" << DESKTOP
-[Desktop Entry]
-Type=Application
-Name=CopyQ Clipboard History
-Exec=copyq
-X-GNOME-Autostart-enabled=true
-OnlyShowIn=MATE;
-DESKTOP
-
-cat > "/home/$USERNAME/.config/autostart/sona-session-init.desktop" << DESKTOP
+cat > /etc/xdg/autostart/sona-session-init.desktop << DESKTOP
 [Desktop Entry]
 Type=Application
 Name=Sona Desktop Session Init
 Exec=/usr/local/bin/sona-session-init
-X-GNOME-Autostart-enabled=true
-OnlyShowIn=MATE;
+OnlyShowIn=KDE;
+X-KDE-autostart-phase=2
 DESKTOP
 
-cp "/home/$USERNAME/.config/autostart/"*.desktop /etc/skel/.config/autostart/
+if [[ "$SERIAL_CONSOLE" == "y" ]]; then
+    # Automated install test only: copy the journal to the serial port and
+    # log a line once SonicDE has started, so the test can see the desktop.
+    mkdir -p /etc/systemd/journald.conf.d
+    cat > /etc/systemd/journald.conf.d/50-sona-serial.conf << JOURNAL_SERIAL
+[Journal]
+ForwardToConsole=yes
+TTYPath=/dev/ttyS0
+MaxLevelConsole=info
+JOURNAL_SERIAL
+    cat > /etc/xdg/autostart/sona-ci-desktop.desktop << CI_DESKTOP
+[Desktop Entry]
+Type=Application
+Name=Sona install test marker
+Exec=logger -t sona-ci "SONA-CI: DESKTOP STARTED"
+OnlyShowIn=KDE;
+X-KDE-autostart-phase=2
+CI_DESKTOP
+fi
+
 chown -R "$USERNAME:$USERNAME" "/home/$USERNAME"
 
 # 19. Refresh the boot menu now that everything is installed, so it also
 # lists Windows or other systems found by os-prober. GRUB itself was
 # installed earlier, so a failure here still leaves a bootable system.
-grub-mkconfig -o /boot/grub/grub.cfg || echo "Warning: could not refresh the GRUB menu. Run grub-mkconfig -o /boot/grub/grub.cfg after reboot."
+[[ "$QUICK_TEST" == "y" ]] || grub-mkconfig -o /boot/grub/grub.cfg || echo "Warning: could not refresh the GRUB menu. Run grub-mkconfig -o /boot/grub/grub.cfg after reboot."
 EOF
 
 chmod +x /mnt/root/setup-chroot.sh
+
+# Sona extras: Orca Bridge, the Kokoro setup, Sona's PKGBUILDs (OpenEVV),
+# and the Windows XP theme kit (if chosen). From the Sona live ISO if they
+# are there, otherwise downloaded from the Sona repository on GitHub. A
+# problem here never stops the install.
+rm -rf /mnt/root/sona-extras
+mkdir -p /mnt/root/sona-extras
+if [[ -d /usr/share/sona/orca-bridge ]]; then
+    for extra in orca-bridge kokoro packages xp-theme xp-sounds; do
+        [[ -d "/usr/share/sona/$extra" ]] && cp -r "/usr/share/sona/$extra" /mnt/root/sona-extras/
+    done
+elif ! curl -fsSL "https://github.com/chasecichorz/sona/archive/refs/heads/main.tar.gz" |
+        tar -xz --strip-components=1 -C /mnt/root/sona-extras \
+            sona-main/orca-bridge sona-main/kokoro sona-main/packages sona-main/xp-theme; then
+    echo "Warning: could not download Sona's extras (Orca Bridge, Kokoro, OpenEVV, XP theme), so they were skipped."
+fi
+[[ "$XP_THEME" == "y" ]] || rm -rf /mnt/root/sona-extras/xp-theme /mnt/root/sona-extras/xp-sounds
 
 echo "Configuring Sona Linux inside chroot..."
 arch-chroot /mnt /root/setup-chroot.sh

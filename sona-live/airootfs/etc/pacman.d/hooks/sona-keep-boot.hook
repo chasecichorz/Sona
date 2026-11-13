@@ -1,0 +1,20 @@
+# remove from airootfs!
+# Sona: keep copies of the kernel and CPU microcode inside the live image.
+# mkarchiso empties /boot in the image (the ISO keeps its kernel elsewhere),
+# but the installer's "copy the live system" method needs them: it puts
+# these copies back in /boot on the new disk.
+
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = linux
+Target = amd-ucode
+Target = intel-ucode
+
+[Action]
+Description = Keeping copies of the kernel and microcode for the Sona installer...
+When = PostTransaction
+Depends = sh
+Depends = coreutils
+Exec = /bin/sh -c 'mkdir -p /usr/share/sona/boot; cp -f /boot/vmlinuz-linux /boot/*-ucode.img /usr/share/sona/boot/ 2>/dev/null; true'

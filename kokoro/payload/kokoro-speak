@@ -1,0 +1,74 @@
+#!/usr/bin/python3 -I
+"""Speak stdin with Kokoro. Used by speech-dispatcher's kokoro module.
+
+usage: kokoro-speak VOICE RATE VOLUME   (RATE, VOLUME: -100..100)
+Starts the Kokoro helper if it is not running, streams its audio to paplay.
+"""
+import json, os, socket, subprocess, sys, time
+
+SERVER = "/opt/kokoro-speechd/kokoro-server.py"
+
+
+def sock_path():
+    base = os.environ.get("XDG_RUNTIME_DIR") or os.path.join(
+        os.path.expanduser("~"), ".cache")
+    return os.path.join(base, "kokoro-speechd", "kokoro.sock")
+
+
+def connect():
+    path = sock_path()
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.connect(path)
+        return s
+    except OSError:
+        pass
+    # Own session so speech-dispatcher's stop (kill of our group) spares it.
+    subprocess.Popen([SERVER], start_new_session=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+    for _ in range(200):  # up to 20 s for the first model load
+        time.sleep(0.1)
+        try:
+            s.connect(path)
+            return s
+        except OSError:
+            continue
+    sys.exit("kokoro-speak: helper did not start")
+
+
+def num(i, default):
+    try:
+        return float(sys.argv[i])
+    except (IndexError, ValueError):
+        return default
+
+
+def main():
+    voice = sys.argv[1] if len(sys.argv) > 1 else "af_heart"
+    rate, volume = num(2, 0), num(3, 100)
+    text = sys.stdin.read()
+    if not text.strip():
+        return
+    req = {"text": text, "voice": voice,
+           "speed": 2 ** (rate / 100),        # -100..100 -> 0.5x..2x
+           "gain": (volume + 100) / 200}      # -100..100 -> 0..1
+    # Start the player first so it is ready by the time audio arrives.
+    play = subprocess.Popen(["paplay", "--raw", "--rate=24000",
+                             "--channels=1", "--format=s16le",
+                             "--latency-msec=40", "--client-name=Kokoro"],
+                            stdin=subprocess.PIPE)
+    s = connect()
+    s.sendall((json.dumps(req) + "\n").encode())
+    s.shutdown(socket.SHUT_WR)
+    while chunk := s.recv(65536):
+        play.stdin.write(chunk)
+        play.stdin.flush()
+    play.stdin.close()
+    play.wait()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (BrokenPipeError, KeyboardInterrupt):
+        pass

@@ -53,7 +53,7 @@ jobs:
 
       - name: Check shell syntax
         run: |
-          for f in Install /tmp/setup-chroot.sh scripts/*.sh scripts/ci/*.sh \
+          for f in Install /tmp/setup-chroot.sh scripts/*.sh scripts/ci/*.sh xp-theme/*.sh xp-theme/payload/scripts/*.sh \
                    sona-live/profiledef.sh sona-live/airootfs/usr/local/bin/sona-session-audio \
                    sona-live/airootfs/usr/local/bin/sona-pick-sound; do
             echo "bash -n $f"
@@ -63,7 +63,7 @@ jobs:
       - name: Run shellcheck (errors only)
         run: |
           shellcheck --version
-          shellcheck -S error -s bash Install /tmp/setup-chroot.sh scripts/*.sh scripts/ci/*.sh \
+          shellcheck -S error -s bash Install /tmp/setup-chroot.sh scripts/*.sh scripts/ci/*.sh xp-theme/*.sh xp-theme/sona-xp-firstrun orca-bridge/sona-orca-extensions kokoro/sona-kokoro-setup packages/openevv-git/sona-openevv-update \
             sona-live/airootfs/usr/local/bin/sona-session-audio \
             sona-live/airootfs/usr/local/bin/sona-pick-sound
 
@@ -81,7 +81,7 @@ jobs:
 
     steps:
       - name: Install build tools
-        run: pacman -Syu --noconfirm --needed archiso git
+        run: pacman -Syu --noconfirm --needed archiso git python-pip
 
       - name: Check out the repository
         uses: actions/checkout@v5
@@ -192,7 +192,7 @@ jobs:
           cat > notes.md <<EOF
           Sona Linux live ISO built on ${{ needs.build.outputs.date }}.
 
-          Boot it and the MATE desktop starts with the Orca screen reader talking.
+          Boot it and the SonicDE desktop starts with the Orca screen reader talking.
           Choose "Sona Linux live console with speech" in the boot menu for a text
           console with espeakup instead.
 

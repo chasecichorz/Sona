@@ -1,0 +1,12 @@
+[Unit]
+Description=Set up Sona's Orca extensions, Kokoro voices, and graphics driver for the live system
+Before=display-manager.service getty@tty1.service
+After=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/sona-live-setup
+
+[Install]
+WantedBy=multi-user.target

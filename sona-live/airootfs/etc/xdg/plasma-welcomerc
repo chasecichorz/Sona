@@ -1,0 +1,3 @@
+# Sona: treat the Welcome Center as already seen (see kded6rc).
+[General]
+LastSeenVersion=99.0.0

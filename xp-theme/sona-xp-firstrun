@@ -1,0 +1,44 @@
+#!/bin/bash
+# Turn on the Windows XP theme for this user, once. Started at login by
+# sona-session-init (installed systems) and by the live desktop's autostart.
+#
+# The XP sounds belong to Microsoft, so public Sona builds do not include
+# them: the kit downloads them from archive.org (checksum checked). This
+# waits for the network and keeps trying for about 15 minutes. A private
+# build can include them in /usr/share/sona/xp-sounds (see
+# scripts/build-iso.sh, SONA_BUNDLE_XP_SOUNDS); then no download is needed.
+set -uo pipefail
+
+kit=/usr/share/sona/xp-theme
+state="$HOME/.config/sona"
+done_marker="$state/xp-theme-installed"
+log="$state/xp-theme-install.log"
+sounds="$HOME/.local/share/sounds/windows-xp"
+
+[[ -f /etc/sona/xp-theme && -x "$kit/install-xp-theme.sh" ]] || exit 0
+[[ -f "$done_marker" ]] && exit 0
+mkdir -p "$state"
+
+# Only one copy at a time.
+exec 9>"$state/xp-theme.lock"
+flock -n 9 || exit 0
+
+if [[ -d /usr/share/sona/xp-sounds ]]; then
+    mkdir -p "$sounds"
+    cp -n /usr/share/sona/xp-sounds/*.wav "$sounds/" 2>/dev/null || true
+fi
+
+for try in $(seq 1 30); do
+    command -v nm-online >/dev/null && nm-online -q -t 30 >/dev/null 2>&1
+    if "$kit/install-xp-theme.sh" --no-packages >"$log" 2>&1; then
+        touch "$done_marker"
+        # Start the XP helpers now; they play the XP startup sound.
+        "$HOME/.local/share/xp-theme/xp_sonicde.py" >/dev/null 2>&1 &
+        "$HOME/.local/share/xp-theme/xp_autoplay.py" >/dev/null 2>&1 &
+        exit 0
+    fi
+    echo "Attempt $try failed; trying again in 30 seconds." >>"$log"
+    sleep 30
+done
+notify-send "Windows XP sounds" "Setup could not finish (no internet?). It will try again at the next login. Details: $log" 2>/dev/null || true
+exit 1

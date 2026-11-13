@@ -1,0 +1,46 @@
+# Local PKGBUILD for OpenEVV (Embedded ViaVoice / Eloquence engine) built from source.
+# Built on each Sona system by /usr/local/bin/sona-openevv-update (weekly
+# timer), because the language data in OpenEVV is IBM's and cannot be
+# shipped prebuilt in the public ISO. See packages/openevv-git/README.txt.
+pkgname=openevv-git
+pkgver=r979.7ffd754
+pkgrel=2
+pkgdesc="Open implementation of IBM Embedded ViaVoice with Speech Dispatcher support (built from git)"
+arch=('x86_64')
+url="https://github.com/mudb0y/openevv"
+license=('MIT' 'custom')
+depends=('libpulse' 'speech-dispatcher' 'glib2')
+makedepends=('git' 'python' 'pkgconf' 'gcc' 'make')
+provides=('openevv')
+conflicts=('openevv')
+backup=('etc/speech-dispatcher/modules/openevv.conf')
+options=('!lto' '!debug')
+source=("openevv::git+https://github.com/mudb0y/openevv.git")
+sha256sums=('SKIP')
+
+# Every language the module offers (Japanese is linked but not offered by speechd).
+_langs="lang/enus lang/engb lang/dede lang/eses lang/esus lang/frfr lang/frca lang/itit lang/plpl lang/jajp lang/fifi lang/ptbr"
+
+pkgver() {
+  cd openevv
+  printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+_make() {
+  make RULES=c "LANGS=${_langs}" PREFIX=/usr \
+    SPEECHD_MODULEDIR=/usr/lib/speech-dispatcher/speech-dispatcher-modules \
+    SPEECHD_CONFDIR=/etc/speech-dispatcher/modules "$@"
+}
+
+build() {
+  cd openevv
+  _make -j"$(nproc)" all speechd
+}
+
+package() {
+  cd openevv
+  _make DESTDIR="$pkgdir" install speechd-install
+  install -Dm644 LICENSE NOTICE -t "$pkgdir/usr/share/licenses/$pkgname/"
+  install -Dm644 README.md docs/building.md docs/speech-dispatcher.md docs/using.md \
+    -t "$pkgdir/usr/share/doc/$pkgname/"
+}

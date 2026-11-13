@@ -129,11 +129,10 @@ zsh
 libnewt
 git
 # --- Sona live desktop ---
-xorg-server
-xf86-video-vesa
+xlibre-video-vesa
 mesa
-mate
-mate-terminal
+sonicde-meta
+terminator
 lightdm
 lightdm-gtk-greeter
 orca
@@ -151,4 +150,16 @@ firefox
 ttf-dejavu
 sudo
 networkmanager
-network-manager-applet
+dconf
+xdotool
+sox
+sox
+python-dbus
+python-gobject
+gtk3
+libgudev
+libnotify
+udisks2
+gvfs-mtp
+gvfs-gphoto2
+unzip

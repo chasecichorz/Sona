@@ -1,0 +1,11 @@
+[Unit]
+Description=Check for OpenEVV (ViaVoice) updates at boot and every week
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=1w
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

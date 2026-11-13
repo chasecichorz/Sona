@@ -1,0 +1,13 @@
+{
+    "KPackageStructure": "KWin/Script",
+    "KPlugin": {
+        "Id": "xpsounds",
+        "Name": "Windows XP window sounds",
+        "Description": "Plays the XP Restore and Minimize sounds when windows open, close, minimize and restore.",
+        "License": "GPL",
+        "Version": "1.0",
+        "EnabledByDefault": false
+    },
+    "X-Plasma-API": "javascript",
+    "X-Plasma-MainScript": "code/main.js"
+}

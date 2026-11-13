@@ -1,0 +1,89 @@
+#!/bin/bash
+# Set up the Kokoro neural voices as a Speech Dispatcher synthesizer
+# ("kokoro-generic"). Kokoro-82M and kokoro-onnx are Apache-2.0 licensed.
+#
+# The big pieces live in /opt/kokoro-speechd:
+#   models/          kokoro-v1.0.onnx and voices-v1.0.bin (about 350 MB)
+#   site-packages/   kokoro-onnx and its Python dependencies
+#   venv/            a tiny Python environment that points at both
+# The Sona ISO already holds models/ and site-packages/ (scripts/build-iso.sh
+# puts them there), so this needs no internet. On a system installed by
+# download, they are fetched here: --fetch-only does just that.
+#
+# Usage (as root):
+#   sona-kokoro-setup               set everything up (fetches what is missing)
+#   sona-kokoro-setup --fetch-only DIR
+#                                   only download models and Python packages
+#                                   into DIR (used by scripts/build-iso.sh)
+set -euo pipefail
+
+DEST=/opt/kokoro-speechd
+PAYLOAD=/usr/share/sona/kokoro/payload
+URL=https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0
+MODEL_SHA=7d5df8ecf7d4b1878015a32686053fd0eebe2bc377234608764cc0ef3636a6c5
+VOICES_SHA=bca610b8308e8d99f32e6fe4197e7ec01679264efed0cac9140fe9c29f1fbf7d
+KOKORO_ONNX='kokoro-onnx==0.4.7'
+
+fetch_file() {  # name sha dir
+    local f="$3/$1" tmp
+    if [[ -f "$f" ]] && echo "$2  $f" | sha256sum -c --quiet 2>/dev/null; then
+        return 0
+    fi
+    echo "Downloading $1..."
+    tmp="$(mktemp)"
+    curl -fL --retry 3 -sS -o "$tmp" "$URL/$1" || { rm -f "$tmp"; return 1; }
+    echo "$2  $tmp" | sha256sum -c --quiet || { rm -f "$tmp"; echo "$1 failed its checksum." >&2; return 1; }
+    install -Dm644 "$tmp" "$f"
+    rm -f "$tmp"
+}
+
+fetch_all() {  # dir
+    local dir="$1"
+    mkdir -p "$dir/models" "$dir/site-packages"
+    fetch_file kokoro-v1.0.onnx "$MODEL_SHA" "$dir/models" || return 1
+    fetch_file voices-v1.0.bin "$VOICES_SHA" "$dir/models" || return 1
+    if [[ ! -d "$dir/site-packages/kokoro_onnx" ]]; then
+        echo "Downloading $KOKORO_ONNX and its Python packages..."
+        # numpy and onnxruntime come from Arch packages, not from pip.
+        python3 -m pip install --quiet --disable-pip-version-check --no-warn-script-location \
+            --root-user-action=ignore --target "$dir/site-packages" "$KOKORO_ONNX" || return 1
+        rm -rf "$dir/site-packages"/numpy "$dir/site-packages"/numpy-*.dist-info \
+            "$dir/site-packages"/numpy.libs "$dir/site-packages"/onnxruntime \
+            "$dir/site-packages"/onnxruntime-*.dist-info "$dir/site-packages"/bin
+    fi
+}
+
+if [[ "${1:-}" == "--fetch-only" ]]; then
+    fetch_all "${2:?usage: $0 --fetch-only DIR}"
+    exit 0
+fi
+
+[[ $EUID -eq 0 ]] || { echo "Run as root." >&2; exit 1; }
+[[ -d "$PAYLOAD" ]] || { echo "Missing $PAYLOAD" >&2; exit 1; }
+
+if ! fetch_all "$DEST"; then
+    echo "Kokoro could not be downloaded (no internet?). Run sona-kokoro-setup again later."
+    exit 75
+fi
+
+# The environment the helper runs in: system Python packages (numpy,
+# onnxruntime, soundfile) plus /opt/kokoro-speechd/site-packages.
+rm -rf "$DEST/venv"
+python3 -m venv --system-site-packages --without-pip "$DEST/venv"
+site="$("$DEST/venv/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+echo "$DEST/site-packages" > "$site/sona-kokoro.pth"
+
+install -m755 "$PAYLOAD/kokoro-server.py" "$DEST/kokoro-server.py"
+install -m755 "$PAYLOAD/kokoro-speak" /usr/local/bin/kokoro-speak
+install -Dm644 "$PAYLOAD/kokoro-generic.conf" /etc/speech-dispatcher/modules/kokoro-generic.conf
+
+# A setup that lists its modules by hand needs a line for Kokoro too.
+conf=/etc/speech-dispatcher/speechd.conf
+if [[ -f "$conf" ]] && grep -q '^AddModule ' "$conf" && ! grep -q '^AddModule kokoro-generic ' "$conf"; then
+    last="$(grep -n '^AddModule ' "$conf" | tail -1 | cut -d: -f1)"
+    sed -i "${last}a AddModule kokoro-generic sd_generic kokoro-generic.conf" "$conf"
+fi
+
+"$DEST/venv/bin/python" -I -c 'import kokoro_onnx, onnxruntime, numpy' ||
+    { echo "Kokoro's Python packages do not load." >&2; exit 1; }
+echo "Kokoro is set up. In Orca's speech settings choose the synthesizer kokoro-generic."

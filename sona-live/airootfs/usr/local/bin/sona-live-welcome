@@ -1,0 +1,10 @@
+#!/bin/bash
+# Live ISO: once the desktop and Orca are up, say how to start the installer.
+# Add sona.nowelcome to the boot options to skip this.
+grep -qw sona.nowelcome /proc/cmdline && exit 0
+for _ in $(seq 1 60); do
+    pgrep -u "$(id -u)" -x orca >/dev/null && break
+    sleep 1
+done
+sleep 12
+spd-say -w "Welcome to Sona Linux. To install Sona on this computer, press Windows, Alt, I. Or open the Start menu with the Windows key, type install, and press Enter." 2>/dev/null || true

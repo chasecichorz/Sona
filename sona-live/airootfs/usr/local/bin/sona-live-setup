@@ -1,0 +1,23 @@
+#!/bin/bash
+# Live ISO, at boot, before the desktop starts. Each part is allowed to
+# fail without stopping the others.
+
+# Orca extensions (Orca Bridge, wine-access), approved for the live user.
+if [[ ! -e /home/sona/.local/share/orca/extensions/remote ]]; then
+    /usr/local/bin/sona-orca-extensions /home/sona sona || echo "Orca extensions were not set up."
+fi
+
+# Kokoro voices: the model and Python packages are on the ISO, so this
+# only makes the small Python environment and the Speech Dispatcher module.
+if [[ ! -e /opt/kokoro-speechd/venv ]]; then
+    /usr/local/bin/sona-kokoro-setup || echo "Kokoro was not set up."
+fi
+
+# Graphics: the ISO carries the NVIDIA driver, which turns the open-source
+# nouveau driver off. NVIDIA cards older than RTX 20 / GTX 16 cannot use the
+# NVIDIA driver, so load nouveau for them by hand.
+gpu_info="$(lspci -nn 2>/dev/null | grep -Ei 'VGA|3D|Display' || true)"
+if echo "$gpu_info" | grep -qi nvidia && ! echo "$gpu_info" | grep -Eqi '\b(TU|GA|AD|GB|GH)[0-9]{3}'; then
+    modprobe nouveau || echo "Could not load nouveau."
+fi
+exit 0

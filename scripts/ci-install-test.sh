@@ -5,7 +5,7 @@
 # 2. The live system downloads scripts/ci/startup.sh, which runs
 #    sona-install --unattended with scripts/ci/answers.conf.
 # 3. Boots the installed disk and checks that it reaches a login prompt
-#    and starts the desktop (LightDM).
+#    and starts the SonicDE desktop (auto-login on tty1, then startx).
 #
 # Usage: scripts/ci-install-test.sh path/to/sona.iso [uefi|bios]
 #
@@ -21,7 +21,10 @@ log_dir="${LOG_DIR:-$repo_dir/out/ci-logs}"
 install_timeout_min="${INSTALL_TIMEOUT_MIN:-110}"
 boot_timeout_sec="${BOOT_TIMEOUT_SEC:-600}"
 
-work="$(mktemp -d)"
+# Not in /tmp: on many computers /tmp is in RAM and too small for the
+# virtual disk, which then fails part way through the install.
+mkdir -p "$repo_dir/out"
+work="$(mktemp -d -p "$repo_dir/out" ci-work.XXXXXX)"
 server_pid=""
 qemu_pid=""
 cleanup() {
@@ -99,7 +102,7 @@ common=(
 
 # --- Phase 1: unattended install.
 echo "== Phase 1: installing (up to $install_timeout_min minutes)"
-cmdline="archisobasedir=arch archisodevice=/dev/sr0 sona.console accessibility=on console=tty0 console=ttyS0,115200 script=http://10.0.2.2:8000/startup.sh"
+cmdline="archisobasedir=arch archisodevice=/dev/sr0 sona.console systemd.unit=multi-user.target accessibility=on console=tty0 console=ttyS0,115200 script=http://10.0.2.2:8000/startup.sh"
 set +e
 timeout "${install_timeout_min}m" qemu-system-x86_64 "${common[@]}" \
     -cdrom "$iso" \
@@ -121,11 +124,11 @@ qemu-system-x86_64 "${common[@]}" -serial "file:$boot_log" &
 qemu_pid=$!
 
 got_login=no
-got_lightdm=no
+got_desktop=no
 for _ in $(seq 1 $((boot_timeout_sec / 5))); do
     grep -q "login:" "$boot_log" && got_login=yes
-    grep -q "Started .*Light Display Manager" "$boot_log" && got_lightdm=yes
-    [[ "$got_login" == yes && "$got_lightdm" == yes ]] && break
+    grep -q "SONA-CI: DESKTOP STARTED" "$boot_log" && got_desktop=yes
+    [[ "$got_login" == yes && "$got_desktop" == yes ]] && break
     kill -0 "$qemu_pid" 2>/dev/null || break
     sleep 5
 done
@@ -134,13 +137,13 @@ wait "$qemu_pid" 2>/dev/null || true
 qemu_pid=""
 
 echo "Reached a login prompt: $got_login"
-echo "Started the desktop (LightDM): $got_lightdm"
+echo "Started the desktop (SonicDE): $got_desktop"
 if grep -q "Failed to start" "$boot_log"; then
     echo "Services that failed to start:"
     grep "Failed to start" "$boot_log" | sort -u
 fi
 
-if [[ "$got_login" != yes || "$got_lightdm" != yes ]]; then
+if [[ "$got_login" != yes || "$got_desktop" != yes ]]; then
     echo "FAIL: the installed system did not boot fully. Last 80 lines of the boot log:"
     tail -n 80 "$boot_log"
     exit 1

@@ -1,0 +1,13 @@
+[Unit]
+Description=Build or update the OpenEVV (ViaVoice) voice from source
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/sona-openevv-update
+# Exit code 75 means no internet yet; that is not a failure.
+SuccessExitStatus=75
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=30min

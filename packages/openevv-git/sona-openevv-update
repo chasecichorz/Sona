@@ -1,0 +1,66 @@
+#!/bin/bash
+# Build OpenEVV (the IBM ViaVoice / Eloquence voice) from its git source,
+# install it, and make it the default Speech Dispatcher voice.
+#
+# Sona cannot ship OpenEVV prebuilt: its language data is IBM's, so every
+# computer builds its own copy from https://github.com/mudb0y/openevv.
+# Runs at install time, at boot until it has worked once, and weekly
+# (sona-openevv-update.timer). It only rebuilds when upstream has a new
+# commit, so most runs take a second.
+#
+# Usage (as root):  sona-openevv-update [--force]
+set -euo pipefail
+
+PKGBUILD_SRC=/usr/share/sona/packages/openevv-git/PKGBUILD
+UPSTREAM=https://github.com/mudb0y/openevv
+BUILD_USER=sona-build
+BUILD_HOME=/var/lib/sona-build
+SPEECHD_CONF=/etc/speech-dispatcher/speechd.conf
+
+force=no
+[[ "${1:-}" == "--force" ]] && force=yes
+[[ $EUID -eq 0 ]] || { echo "Run as root." >&2; exit 1; }
+[[ -f "$PKGBUILD_SRC" ]] || { echo "Missing $PKGBUILD_SRC" >&2; exit 1; }
+
+make_default() {
+    [[ -f "$SPEECHD_CONF" ]] || return 0
+    if grep -q '^DefaultModule' "$SPEECHD_CONF"; then
+        sed -i 's/^DefaultModule .*/DefaultModule openevv/' "$SPEECHD_CONF"
+    elif grep -q '^#\s*DefaultModule' "$SPEECHD_CONF"; then
+        sed -i '0,/^#\s*DefaultModule.*/s//DefaultModule openevv/' "$SPEECHD_CONF"
+    else
+        echo "DefaultModule openevv" >> "$SPEECHD_CONF"
+    fi
+    # If the config lists modules explicitly, OpenEVV must be one of them.
+    if grep -q '^AddModule' "$SPEECHD_CONF" && ! grep -q '^AddModule openevv ' "$SPEECHD_CONF"; then
+        sed -i '0,/^AddModule/s//AddModule openevv sd_openevv openevv.conf\nAddModule/' "$SPEECHD_CONF"
+    fi
+}
+
+latest=$(git ls-remote "$UPSTREAM" HEAD 2>/dev/null | cut -c1-7) || true
+if [[ -z "$latest" ]]; then
+    echo "Could not reach $UPSTREAM (no internet?). Try again later."
+    exit 75
+fi
+installed=$(pacman -Q openevv-git 2>/dev/null | sed -n 's/.*\.\([0-9a-f]\{7\}\)-.*/\1/p') || true
+if [[ "$force" == no && "$installed" == "$latest" ]]; then
+    echo "OpenEVV is up to date ($installed)."
+    make_default
+    exit 0
+fi
+echo "Building OpenEVV ${installed:+$installed -> }$latest..."
+
+# makepkg refuses to run as root, so build as a small system user.
+id "$BUILD_USER" >/dev/null 2>&1 || useradd -r -d "$BUILD_HOME" -s /usr/bin/nologin "$BUILD_USER"
+work="$BUILD_HOME/openevv-git"
+rm -rf "$work"
+install -d -o "$BUILD_USER" -g "$BUILD_USER" "$BUILD_HOME" "$work"
+install -m644 -o "$BUILD_USER" "$PKGBUILD_SRC" "$work/PKGBUILD"
+# The dependencies are already installed by Sona; --syncdeps would need sudo.
+runuser -u "$BUILD_USER" -- env HOME="$BUILD_HOME" bash -c "cd '$work' && makepkg --noconfirm --cleanbuild"
+pkg=$(find "$work" -maxdepth 1 -name 'openevv-git-*-x86_64.pkg.tar.zst' ! -name '*-debug-*' | head -n 1)
+[[ -n "$pkg" ]] || { echo "Build finished but no package was made." >&2; exit 1; }
+pacman -U --noconfirm "$pkg"
+rm -rf "$work"
+make_default
+echo "OpenEVV $latest is installed and is the default voice."

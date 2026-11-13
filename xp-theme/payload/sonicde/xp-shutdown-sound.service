@@ -1,0 +1,16 @@
+[Unit]
+Description=Play the Windows XP shutdown sound when the session or system goes down
+# Ordered after the audio stack, so on shutdown this stops (and plays) first,
+# while PipeWire and the speaker EQ are still running.
+After=pipewire.service pipewire-pulse.service wireplumber.service filter-chain.service
+Wants=pipewire.service wireplumber.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=/usr/bin/pw-play "%h/.local/share/sounds/windows-xp/Windows XP Shutdown.wav"
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

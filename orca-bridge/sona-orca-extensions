@@ -1,0 +1,136 @@
+#!/bin/bash
+# Install and approve the Orca extensions Sona ships, so Orca loads them
+# without a trip to Preferences:
+#   remote        Orca Bridge (NVDA Remote-compatible remote access),
+#                 unpacked from /usr/share/sona/orca-bridge/remote.orca-ext
+#   wine_access   screen reader support for Windows programs in Wine, a
+#                 link to the wine-access package's files (if installed)
+#
+# Usage:
+#   sona-orca-extensions                    for yourself, in your session
+#   sona-orca-extensions --refresh          the same, quietly; restarts Orca
+#                                           only if an approval changed
+#                                           (run at login by sona-session-init)
+#   sona-orca-extensions HOME_DIR [OWNER]   as root, for a new home folder
+#
+# Orca keeps approvals in the user's own dconf database, as a list of
+# extension name and SHA-256 of its files. A system-wide dconf default is
+# not enough, because Orca only reads values the user has set. An extension
+# whose files change (a package update) must be approved again, which is
+# what --refresh does. Both extensions come from files only root can change.
+set -euo pipefail
+
+ARCHIVE="${SONA_ORCA_BRIDGE_ARCHIVE:-/usr/share/sona/orca-bridge/remote.orca-ext}"
+WINE_ACCESS_SRC=/usr/share/wine-access/orca/wine_access
+KEY=/org/gnome/orca/default/extensions/approved-user-extensions
+
+refresh=no
+if [[ "${1:-}" == "--refresh" ]]; then
+    refresh=yes
+    shift
+fi
+home="${1:-$HOME}"
+owner="${2:-}"
+ext="$home/.local/share/orca/extensions"
+mkdir -p "$ext"
+
+# The same hash Orca computes (orca.extension_loader._compute_package_hash).
+ext_hash() {
+    python3 - "$1" <<'PY'
+import hashlib, os, sys
+dirpath = sys.argv[1]
+try:
+    from orca.extension_loader import ExtensionLoader
+    print(ExtensionLoader._compute_hash(dirpath))
+    raise SystemExit
+except ImportError:
+    pass
+sha = hashlib.sha256()
+for root, dirs, files in os.walk(dirpath):
+    dirs[:] = sorted(d for d in dirs if d != "__pycache__" and not d.startswith("."))
+    for name in sorted(files):
+        if name.startswith(".") or name.endswith((".pyc", ".pyo", "~")):
+            continue
+        path = os.path.join(root, name)
+        sha.update(os.path.relpath(path, dirpath).replace(os.sep, "/").encode())
+        sha.update(b"\0")
+        with open(path, "rb") as f:
+            sha.update(f.read())
+        sha.update(b"\0")
+print(sha.hexdigest())
+PY
+}
+
+declare -A approve=()
+
+# Orca Bridge: unpack the archive unless this exact version is already there.
+if [[ -f "$ARCHIVE" ]]; then
+    stamp="$(sha256sum "$ARCHIVE" | cut -d' ' -f1)"
+    if [[ "$(cat "$ext/remote/.sona-archive" 2>/dev/null)" != "$stamp" ]]; then
+        rm -rf "$ext/remote"
+        mkdir -p "$ext/remote"
+        python3 -m zipfile -e "$ARCHIVE" "$ext/remote"
+        echo "$stamp" > "$ext/remote/.sona-archive"
+    fi
+    approve[remote]="$(ext_hash "$ext/remote")"
+fi
+
+# wine-access: a link, so it follows package updates.
+if [[ -d "$WINE_ACCESS_SRC" ]]; then
+    ln -sfn "$WINE_ACCESS_SRC" "$ext/wine_access"
+    approve[wine_access]="$(ext_hash "$WINE_ACCESS_SRC")"
+fi
+
+if [[ ${#approve[@]} -eq 0 ]]; then
+    echo "No Sona Orca extensions are installed on this system."
+    exit 0
+fi
+wanted="$(for name in "${!approve[@]}"; do printf '%s %s\n' "$name" "${approve[$name]}"; done | sort)"
+
+changed=no
+db="$home/.config/dconf/user"
+if [[ -z "$owner" && -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] && command -v dconf >/dev/null; then
+    # In your own session: merge into whatever is already approved.
+    current="$(dconf read "$KEY" 2>/dev/null || true)"
+    new="$(python3 - "$current" "$wanted" <<'PY'
+import ast, sys
+cur = sys.argv[1].strip()
+d = ast.literal_eval(cur.replace("@a{ss} ", "")) if cur else {}
+for line in sys.argv[2].splitlines():
+    name, digest = line.split()
+    d[name] = digest
+print("{" + ", ".join(f"'{k}': '{v}'" for k, v in sorted(d.items())) + "}")
+PY
+)"
+    if [[ "$new" != "$current" ]]; then
+        dconf write "$KEY" "$new"
+        changed=yes
+    fi
+elif [[ ! -f "$db" ]]; then
+    # A new home with no settings yet: write the dconf database directly.
+    keyfiles="$(mktemp -d)"
+    {
+        echo "[org/gnome/orca/default/extensions]"
+        printf 'approved-user-extensions={'
+        echo "$wanted" | awk '{printf "%s\047%s\047: \047%s\047", (NR > 1 ? ", " : ""), $1, $2}'
+        echo "}"
+    } > "$keyfiles/orca-extensions"
+    mkdir -p "$home/.config/dconf"
+    dconf compile "$db" "$keyfiles"
+    rm -rf "$keyfiles"
+    changed=yes
+else
+    echo "Note: $db already exists, so the extensions were installed but not approved." >&2
+    echo "Log in as that user and run sona-orca-extensions." >&2
+fi
+
+if [[ -n "$owner" ]]; then
+    chown -R "$owner:" "$home/.local" "$home/.config"
+fi
+
+if [[ "$refresh" == yes ]]; then
+    # At login: only speak up (by restarting Orca) if something changed.
+    [[ "$changed" == yes ]] && pgrep -u "$(id -u)" -x orca >/dev/null && (orca --replace >/dev/null 2>&1 &)
+    exit 0
+fi
+echo "Orca extensions installed and approved for $home: ${!approve[*]}. Restart Orca to load them."

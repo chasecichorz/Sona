@@ -1,0 +1,4 @@
+# Sona live: never lock the screen (the live user has no password).
+[Daemon]
+Autolock=false
+LockOnResume=false
