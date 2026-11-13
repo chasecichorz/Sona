@@ -150,11 +150,15 @@ As of 2026-11-13:
 - Merged into `main` and pushed once (commit 8d52184). **Chase asked to stop
   pushing to GitHub for now:** commit locally on `sonicde` only, no `git push`,
   until he says otherwise.
-- Newest ISO: `out/sona-2026.11.13-x86_64.iso` (4.0 GB, built 13:49). Has
-  everything below. **Not yet tested**: not booted, no VM install test.
-- The USB stick (SanDisk) still has an older build whose installer has known
-  bugs (no DNS in the copy install, keys added too late). Rewrite it with
-  the new ISO before Chase installs on real hardware (ASUS TUF F16, NVIDIA).
+- Newest ISO: `out/sona-2026.11.13-x86_64.iso` (4.0 GB, built 15:12 from
+  commit 8d799bd: XP on by default, quiet installer with "Step N of 5" status
+  box, installer shortcut/Start menu entry). Written to the SanDisk USB stick
+  and verified byte for byte. Not yet run: the full VM install tests.
+- Chase is deciding which Stormux-installer ideas to adopt (plain numbered
+  prompts, type YES to erase, several users, more disk layouts, game
+  managers/Steam/SSH, carry over the live speech engine, summary + sound at
+  the end) and wants the live ISO to log in like his laptop (tty1 autologin
+  + startx, no LightDM) plus a "load into RAM" boot option.
 - Quick tests before that build: download 53/53; copy online and offline
   passed except one check that only failed against the older ISO.
 
@@ -178,6 +182,8 @@ As of 2026-11-13:
 
 ## Handoff log (newest first; add a line when you stop)
 
+- 2026-11-13, Claude Code: quiet installer status box, XP default on again,
+  15:12 ISO written to USB; studied the Stormux installer.
 - 2026-11-13, Claude Code: XP sounds made optional (default No), merged to
   main, kglobalaccel links for Sona shortcuts, ISO rebuilt for the USB.
 - 2026-11-13, Claude Code: MATE → SonicDE, copy/offline install, Stormux +
