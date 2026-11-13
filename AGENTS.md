@@ -131,28 +131,28 @@ Gotchas we already hit:
 
 ## Current state (update this)
 
-As of 2026-11-13:
+As of 2026-11-13 (evening):
 
-- Branch `sonicde`: all of today's work, committed and pushed to
-  github.com/chasecichorz/sona (branch `sonicde`). Not merged into `main`.
-- Newest ISO: `out/sona-2026.11.13-x86_64.iso` (4.0 GB, built 13:49). Has
-  everything below. **Not yet tested**: not booted, no VM install test.
-- The USB stick (SanDisk) still has an older build whose installer has known
-  bugs (no DNS in the copy install, keys added too late). Rewrite it with
-  the new ISO before Chase installs on real hardware (ASUS TUF F16, NVIDIA).
-- Quick tests before that build: download 53/53; copy online and offline
-  passed except one check that only failed against the older ISO.
+- `main` and `sonicde` on GitHub have all the work (merged at 8d52184).
+- Newest ISO built locally after the merge and written to the SanDisk USB
+  stick (verified byte for byte). Live VM check passed: SonicDE + Orca up,
+  Windows+Alt+I opens the installer, Start menu entry and desktop icon
+  present, Orca Bridge + wine-access approved, Kokoro loads, all repos sync,
+  XP off on the live system.
+- Not yet run on this ISO: the full VM install tests (copy method, UEFI and
+  BIOS). Chase is testing the live system and installer on an ASUS TUF F16.
+- Build-log message "stormux: key ... is unknown / keyring is not writable"
+  is harmless: mkarchiso's package-list step reads the image's pacman.conf
+  before the image has a keyring. The live system trusts the key at boot.
+- Installer stays the custom `Install` script. Calamares is a possible later
+  switch; Chase said not yet.
 
 ## Open tasks
 
-1. Boot-test the new ISO in QEMU (`scripts/boot-sona-qemu.sh`, sound goes to
-   Chase's speakers so he can listen), then run both VM install tests.
-2. Investigate a build-log message: `error: stormux: key ... is unknown` /
-   `keyring is not writable` (around line 3015 of the build log). The build
-   finished and wine-access installed; find out where it comes from and
-   whether the live system's pacman can sync Stormux.
-3. Write the tested ISO to the USB stick (ask Chase first; confirm the device
-   with `lsblk` — last time it was `/dev/sda`, SanDisk 3.2Gen1, 57 GB).
+1. Run both VM install tests on the newest ISO (copy method).
+2. Fix whatever Chase finds on the TUF F16.
+3. Before writing a USB stick again, ask Chase and confirm the device with
+   `lsblk` (it has been `/dev/sda`, SanDisk 3.2Gen1, 57 GB).
 4. Chase asked: find some nice startup sounds to try, play them for him to
    choose from (never test with volume 0), and decide how they fit with the
    XP theme (which already plays XP Startup and Logon).
