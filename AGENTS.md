@@ -132,7 +132,8 @@ Gotchas we already hit:
 
 As of 2026-11-13:
 
-- Branch `sonicde`: all of today's work, **uncommitted**.
+- Branch `sonicde`: all of today's work, committed and pushed to
+  github.com/chasecichorz/sona (branch `sonicde`). Not merged into `main`.
 - Newest ISO: `out/sona-2026.11.13-x86_64.iso` (4.0 GB, built 13:49). Has
   everything below. **Not yet tested**: not booted, no VM install test.
 - The USB stick (SanDisk) still has an older build whose installer has known
@@ -156,7 +157,8 @@ As of 2026-11-13:
    XP theme (which already plays XP Startup and Logon).
 5. When Chase has pushed Orca Bridge to github.com/chasecichorz/orca-bridge,
    refresh `orca-bridge/` and point docs at it.
-6. Commit, then (only when Chase says) push and open a pull request.
+6. Merge `sonicde` into `main` or open a pull request, only when Chase says.
+   Pushing to `main` starts the GitHub ISO build and VM install test.
 
 ## Handoff log (newest first; add a line when you stop)
 
