@@ -515,7 +515,7 @@ if [[ "$UNATTENDED" == yes ]]; then
     [[ -n "$PASSWORD" ]] || err "Answer file: PASSWORD is required."
     ROOT_PASSWORD=$(ans ROOT_PASSWORD "$PASSWORD")
     AUTOLOGIN=$(yes_or_no "$(ans AUTOLOGIN no)")
-    XP_THEME=$(yes_or_no "$(ans XP_THEME yes)")
+    XP_THEME=$(yes_or_no "$(ans XP_THEME no)")
     TIMEZONE=$(ans TIMEZONE "UTC")
     valid_timezone "$TIMEZONE" || err "Answer file: TIMEZONE \"$TIMEZONE\" is not a known time zone."
     LANG_LOCALE=$(ans LANG_LOCALE "en_US.UTF-8")
@@ -567,7 +567,8 @@ Choose No to set a separate root password.") == "y" ]]; then
 
 If you choose No, you log in at the talking text console, and the desktop starts with Orca as soon as you have logged in.")
 
-    XP_THEME=$(ui_yesno "Windows XP Sounds" "Make the desktop sound like Windows XP?
+    # Optional: No is selected, so pressing Enter keeps the SonicDE sounds.
+    XP_THEME=$(ui_yesno_default_no "Windows XP Sounds" "Make the desktop sound like Windows XP?
 
 This adds the Windows XP startup, logon, logoff, shutdown, window, notification, and USB device sounds, plus AutoPlay and Safely Remove Hardware. The sounds are downloaded from archive.org the first time you log in.
 

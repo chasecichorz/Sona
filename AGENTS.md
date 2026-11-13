@@ -47,7 +47,8 @@ everything:
   `kokoro-generic`. The model ships on the ISO.
 - `packages/openevv-git/` — PKGBUILD and updater for OpenEVV (IBM
   ViaVoice/Eloquence), the default voice. Built from source on each machine.
-- `xp-theme/` — the Windows XP sound theme kit for SonicDE (on by default).
+- `xp-theme/` — the Windows XP sound theme kit for SonicDE (optional; the
+  installer asks and defaults to No; the live ISO uses SonicDE's sounds).
 - `.github/workflows/build-and-release.yml` — lint, ISO build, VM install
   test, weekly releases.
 
