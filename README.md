@@ -6,7 +6,7 @@ screen reader, console speech with espeakup, XLibre, and a set of accessible
 everyday apps. The default voice is OpenEVV (ViaVoice / Eloquence), with the
 Kokoro neural voices and espeak-ng also there. Orca Bridge (NVDA Remote
 compatible) and wine-access are set up for every user. Windows XP sounds
-are optional: the installer asks, and No is the default.
+are on by default; the installer asks, and you can choose No.
 
 ## What is in this repository
 

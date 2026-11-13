@@ -47,8 +47,9 @@ everything:
   `kokoro-generic`. The model ships on the ISO.
 - `packages/openevv-git/` — PKGBUILD and updater for OpenEVV (IBM
   ViaVoice/Eloquence), the default voice. Built from source on each machine.
-- `xp-theme/` — the Windows XP sound theme kit for SonicDE (optional; the
-  installer asks and defaults to No; the live ISO uses SonicDE's sounds).
+- `xp-theme/` — the Windows XP sound theme kit for SonicDE. **On by default**
+  (Chase wants it as the default); the installer asks and Yes is selected,
+  and the live ISO has it on too.
 - `.github/workflows/build-and-release.yml` — lint, ISO build, VM install
   test, weekly releases.
 
@@ -146,9 +147,9 @@ Gotchas we already hit:
 
 As of 2026-11-13:
 
-- Merged into `main` and pushed (commit 8d52184); GitHub's ISO build and VM
-  install test ran on that push. Keep working on `sonicde` and merge when
-  Chase says.
+- Merged into `main` and pushed once (commit 8d52184). **Chase asked to stop
+  pushing to GitHub for now:** commit locally on `sonicde` only, no `git push`,
+  until he says otherwise.
 - Newest ISO: `out/sona-2026.11.13-x86_64.iso` (4.0 GB, built 13:49). Has
   everything below. **Not yet tested**: not booted, no VM install test.
 - The USB stick (SanDisk) still has an older build whose installer has known

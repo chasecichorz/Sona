@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Windows XP theme setup
+Exec=/usr/local/bin/sona-xp-firstrun
+OnlyShowIn=KDE;
+X-KDE-autostart-phase=2
