@@ -121,6 +121,19 @@ Gotchas we already hit:
 - Keys for repos already in the copied pacman.conf must be added before the
   first `pacman -Sy`.
 - Do not `pkill -f` from a shell whose own command line matches the pattern.
+- Never `chown -R` (or `rm -rf`) over `out/` while a quick test or VM test may
+  be running: `out/quick/run/root` has the host's `/dev`, `/sys`, pacman cache
+  and `/etc/resolv.conf` mounted inside it. (This happened once on
+  2026-11-13 and changed the owner of host device files.) Do not run a
+  build and a quick test at the same time.
+- SonicDE only registers `X-KDE-Shortcuts=` from menu files that are linked
+  into `/usr/share/kglobalaccel/`. A shortcut in `/usr/share/applications`
+  alone does nothing.
+- The live ISO's installer is reachable three ways: Windows+Alt+I, the Start
+  menu entry "Install Sona Linux" (`/usr/share/applications/sona-install.desktop`),
+  and the desktop icon; it is also announced out loud after login. Keep all
+  of them working. If the terminal-based installer ever stops being good
+  enough, Chase is open to Calamares later, but not yet.
 
 ## Git
 
@@ -131,38 +144,41 @@ Gotchas we already hit:
 
 ## Current state (update this)
 
-As of 2026-11-13 (evening):
+As of 2026-11-13:
 
-- `main` and `sonicde` on GitHub have all the work (merged at 8d52184).
-- Newest ISO built locally after the merge and written to the SanDisk USB
-  stick (verified byte for byte). Live VM check passed: SonicDE + Orca up,
-  Windows+Alt+I opens the installer, Start menu entry and desktop icon
-  present, Orca Bridge + wine-access approved, Kokoro loads, all repos sync,
-  XP off on the live system.
-- Not yet run on this ISO: the full VM install tests (copy method, UEFI and
-  BIOS). Chase is testing the live system and installer on an ASUS TUF F16.
-- Build-log message "stormux: key ... is unknown / keyring is not writable"
-  is harmless: mkarchiso's package-list step reads the image's pacman.conf
-  before the image has a keyring. The live system trusts the key at boot.
-- Installer stays the custom `Install` script. Calamares is a possible later
-  switch; Chase said not yet.
+- Merged into `main` and pushed (commit 8d52184); GitHub's ISO build and VM
+  install test ran on that push. Keep working on `sonicde` and merge when
+  Chase says.
+- Newest ISO: `out/sona-2026.11.13-x86_64.iso` (4.0 GB, built 13:49). Has
+  everything below. **Not yet tested**: not booted, no VM install test.
+- The USB stick (SanDisk) still has an older build whose installer has known
+  bugs (no DNS in the copy install, keys added too late). Rewrite it with
+  the new ISO before Chase installs on real hardware (ASUS TUF F16, NVIDIA).
+- Quick tests before that build: download 53/53; copy online and offline
+  passed except one check that only failed against the older ISO.
 
 ## Open tasks
 
-1. Run both VM install tests on the newest ISO (copy method).
-2. Fix whatever Chase finds on the TUF F16.
-3. Before writing a USB stick again, ask Chase and confirm the device with
-   `lsblk` (it has been `/dev/sda`, SanDisk 3.2Gen1, 57 GB).
+1. Boot-test the new ISO in QEMU (`scripts/boot-sona-qemu.sh`, sound goes to
+   Chase's speakers so he can listen), then run both VM install tests.
+2. Investigate a build-log message: `error: stormux: key ... is unknown` /
+   `keyring is not writable` (around line 3015 of the build log). The build
+   finished and wine-access installed; find out where it comes from and
+   whether the live system's pacman can sync Stormux.
+3. Write the tested ISO to the USB stick (ask Chase first; confirm the device
+   with `lsblk` — last time it was `/dev/sda`, SanDisk 3.2Gen1, 57 GB).
 4. Chase asked: find some nice startup sounds to try, play them for him to
    choose from (never test with volume 0), and decide how they fit with the
    XP theme (which already plays XP Startup and Logon).
 5. When Chase has pushed Orca Bridge to github.com/chasecichorz/orca-bridge,
    refresh `orca-bridge/` and point docs at it.
-6. Merge `sonicde` into `main` or open a pull request, only when Chase says.
-   Pushing to `main` starts the GitHub ISO build and VM install test.
+6. Merge `sonicde` into `main` only when Chase says. Pushing to `main`
+   starts the GitHub ISO build and VM install test (about two hours).
 
 ## Handoff log (newest first; add a line when you stop)
 
+- 2026-11-13, Claude Code: XP sounds made optional (default No), merged to
+  main, kglobalaccel links for Sona shortcuts, ISO rebuilt for the USB.
 - 2026-11-13, Claude Code: MATE → SonicDE, copy/offline install, Stormux +
   Jenux, OpenEVV default, Kokoro, Orca Bridge, wine-access, NVIDIA on ISO,
   quick-test.sh, AGENTS.md. Stopped after the 13:49 ISO build (untested).

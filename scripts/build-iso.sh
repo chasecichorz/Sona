@@ -142,8 +142,11 @@ mkarchiso -v -w "$work_dir" -o "$out_dir" "$profile_dir"
 
 rm -rf "$work_dir" "$profile_dir"
 
+# Give the ISO to the user who ran sudo. Only the ISO files: never chown -R
+# out/, because a quick test or VM test may have a system mounted in there
+# (with this computer's /dev, /sys and package cache bind-mounted).
 if [[ -n "${SUDO_USER:-}" ]]; then
-    chown -R "$SUDO_USER:" "$out_dir"
+    chown "$SUDO_USER:" "$out_dir" "$out_dir"/*.iso
 fi
 
 echo

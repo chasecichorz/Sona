@@ -84,15 +84,74 @@ esac
 # Error handling
 # ---------------------------------------------------------------------------
 
+# Progress and the install log.
+# With menus (not unattended), the long, noisy steps write their output to
+# LOG instead of the screen, and the screen shows one short status box that
+# a screen reader can read: "Step 3 of 5: ...". Unattended installs (and the
+# automated tests) still print everything, and also keep the log.
+LOG=/var/log/sona-install.log
+: > "$LOG" 2>/dev/null || LOG=/tmp/sona-install.log
+QUIET=yes
+STEP_NUM=0
+STEP_TOTAL=5
+
+# step TITLE [DETAIL]: start the next main step.
+step() {
+    STEP_NUM=$((STEP_NUM + 1))
+    show_progress "$@"
+}
+
+# show_progress TITLE [DETAIL]: show the current step again with new detail.
+show_progress() {
+    local msg="Step $STEP_NUM of $STEP_TOTAL: $1"
+    printf '\n== %s%s\n' "$msg" "${2:+ - $2}" >> "$LOG"
+    if [[ "$QUIET" == yes ]]; then
+        clear
+        whiptail --backtitle "$BACKTITLE" --title "Installing Sona Linux" \
+            --infobox "$msg
+
+${2:-This can take a while.}
+
+Details are saved in $LOG." 12 74
+    else
+        printf '\n== %s%s\n' "$msg" "${2:+ - $2}"
+    fi
+}
+
+# quietly COMMAND...: run a noisy command, its output going to the log.
+quietly() {
+    if [[ "$QUIET" == yes ]]; then
+        "$@" >> "$LOG" 2>&1
+    else
+        "$@" 2>&1 | tee -a "$LOG"
+        return "${PIPESTATUS[0]}"
+    fi
+}
+
+# Show what went wrong: the message and the end of the log.
+show_failure() {
+    local msg="$1"
+    echo "Error: $msg" >> "$LOG"
+    if [[ "$QUIET" == yes ]] && command -v whiptail >/dev/null 2>&1; then
+        clear
+        whiptail --backtitle "$BACKTITLE" --title "Installation Stopped" --scrolltext --msgbox "$msg
+
+The last lines of the install log ($LOG) are below. Use the arrow keys to read them, then press Enter.
+
+$(tail -n 25 "$LOG" 2>/dev/null)" 22 78 || true
+        clear
+    fi
+    echo "Error: $msg" >&2
+    echo "The full install log is in $LOG." >&2
+}
+
 # Exit code 130 means the user cancelled a dialog; that is not an error.
 on_error() {
     local rc=$? line=$1
     if [[ $rc -eq 130 ]]; then
         exit 130
     fi
-    echo >&2
-    echo "Error: the installer stopped unexpectedly at line $line (exit code $rc)." >&2
-    echo "Scroll up to read the last command's output for details." >&2
+    show_failure "The installer stopped unexpectedly at line $line (exit code $rc)."
     if [[ "$MOUNTED" == true ]]; then
         # Never leave the saved passwords behind on the target disk.
         rm -f /mnt/root/install.conf /mnt/root/setup-chroot.sh 2>/dev/null || true
@@ -103,7 +162,7 @@ on_error() {
 trap 'on_error $LINENO' ERR
 
 err() {
-    printf "Error: %s\n" "$1" >&2
+    show_failure "$1"
     if [[ "$MOUNTED" == true ]]; then
         # Never leave the saved passwords behind on the target disk.
         rm -f /mnt/root/install.conf /mnt/root/setup-chroot.sh 2>/dev/null || true
@@ -253,6 +312,7 @@ fi
 if [[ "$UNATTENDED" == yes ]]; then
     load_answers "$ANSWER_FILE"
     echo "Unattended install using $ANSWER_FILE"
+    QUIET=no
 fi
 
 # The stock Arch ISO does not include whiptail (package libnewt).
@@ -482,17 +542,19 @@ elif [[ "$UNATTENDED" == yes ]]; then
 else
     setup_network
 fi
-echo "Installing with method: $INSTALL_METHOD, internet: $ONLINE"
+echo "Installing with method: $INSTALL_METHOD, internet: $ONLINE" >> "$LOG"
 
 if [[ "$ONLINE" == y ]]; then
-    echo "Initializing keyring and selecting fast mirrors..."
+    step "Getting ready" "Setting up package signing keys and finding fast download mirrors."
     sed -i 's/^#\?ParallelDownloads.*/ParallelDownloads = 5/' /etc/pacman.conf
-    pacman-key --init
-    pacman-key --populate archlinux
-    pacman -Sy --noconfirm --needed archlinux-keyring reflector
-    if ! reflector --latest 20 --protocol https --sort rate --save /etc/pacman.d/mirrorlist; then
-        echo "Warning: mirror ranking failed. Using the existing mirror list."
+    quietly pacman-key --init
+    quietly pacman-key --populate archlinux
+    quietly pacman -Sy --noconfirm --needed archlinux-keyring reflector
+    if ! quietly reflector --latest 20 --protocol https --sort rate --save /etc/pacman.d/mirrorlist; then
+        echo "Warning: mirror ranking failed. Using the existing mirror list." >> "$LOG"
     fi
+else
+    step "Getting ready" "No internet: installing from this disc only."
 fi
 
 # ---------------------------------------------------------------------------
@@ -782,8 +844,9 @@ Everything on $ROOT_PART will be permanently erased. Other partitions will not b
 
     umount "$ROOT_PART" 2>/dev/null || true
     swapoff "$ROOT_PART" 2>/dev/null || true
-    wipefs -af "$ROOT_PART"
-    mkfs.ext4 -F -L SonaRoot "$ROOT_PART"
+    step "Preparing the disk" "Formatting $ROOT_PART."
+    quietly wipefs -af "$ROOT_PART"
+    quietly mkfs.ext4 -F -L SonaRoot "$ROOT_PART"
 else
     if [[ $(ui_yesno_default_no "Confirm Drive Erase" "WARNING: Everything on this drive will be permanently erased:
 
@@ -793,32 +856,32 @@ Continue?") != "y" ]]; then
         err "Installation cancelled by user."
     fi
 
-    echo "Partitioning $DISK..."
+    step "Preparing the disk" "Erasing and partitioning $DISK_LABEL."
     while read -r p; do
         umount "$p" 2>/dev/null || true
         swapoff "$p" 2>/dev/null || true
     done < <(lsblk -lnpo NAME "$DISK" | tail -n +2)
 
-    wipefs -af "$DISK"
-    sgdisk --zap-all "$DISK"
+    quietly wipefs -af "$DISK"
+    quietly sgdisk --zap-all "$DISK"
     # 1: 1 MiB BIOS boot (lets GRUB boot on legacy BIOS)
     # 2: 1 GiB EFI system partition
     # 3: Linux root, rest of the drive
-    sgdisk \
+    quietly sgdisk \
         -n 1:2048:+1M  -t 1:EF02 -c 1:BIOSBOOT \
         -n 2:0:+1G     -t 2:EF00 -c 2:EFI \
         -n 3:0:0       -t 3:8304 -c 3:SonaRoot \
         "$DISK"
-    partprobe "$DISK"
-    udevadm settle
+    quietly partprobe "$DISK"
+    quietly udevadm settle
 
     EFI_PART=$(part_path "$DISK" 2)
     ROOT_PART=$(part_path "$DISK" 3)
     wait_for_device "$EFI_PART"
     wait_for_device "$ROOT_PART"
 
-    mkfs.fat -F 32 -n EFI "$EFI_PART"
-    mkfs.ext4 -F -L SonaRoot "$ROOT_PART"
+    quietly mkfs.fat -F 32 -n EFI "$EFI_PART"
+    quietly mkfs.ext4 -F -L SonaRoot "$ROOT_PART"
 
     # On a wiped drive it is safe to also install GRUB to the fallback EFI
     # path, so firmware that forgets boot entries can still start Sona.
@@ -853,8 +916,8 @@ fi
 # ---------------------------------------------------------------------------
 
 if [[ "$INSTALL_METHOD" == copy ]]; then
-    echo "Copying the Sona live system to the disk..."
-    unsquashfs -f -d /mnt "$LIVE_IMAGE"
+    step "Copying Sona to the disk" "This takes a few minutes."
+    quietly unsquashfs -f -no-progress -d /mnt "$LIVE_IMAGE"
     # The ISO keeps the kernel outside the image; the copies of the kernel
     # and CPU microcode the image saved are put back in /boot (see
     # sona-live/airootfs/etc/pacman.d/hooks/sona-keep-boot.hook).
@@ -868,8 +931,8 @@ if [[ "$INSTALL_METHOD" == copy ]]; then
     touch /mnt/etc/resolv.conf
     [[ "$ONLINE" == y ]] && cp /etc/pacman.d/mirrorlist /mnt/etc/pacman.d/mirrorlist
 else
-    echo "Installing Sona Linux core system and audio stack..."
-    pacstrap -K /mnt "${SONA_BASE_PKGS[@]}" "${UCODE_PKG[@]}"
+    step "Installing the base system" "Downloading and installing the core packages. This takes a while."
+    quietly pacstrap -K /mnt "${SONA_BASE_PKGS[@]}" "${UCODE_PKG[@]}"
 fi
 
 # Save the Wi-Fi network as a NetworkManager profile so it connects after reboot.
@@ -953,6 +1016,9 @@ on_chroot_error() {
 }
 trap 'on_chroot_error $LINENO' ERR
 
+# Progress for the installer's status box (see "@@STEP" in Install).
+progress() { echo "@@STEP $*"; }
+
 source /root/install.conf
 # QUICK_TEST=y is set only by scripts/quick-test.sh, which runs this script
 # in a container with no real disk: the clock and boot loader steps are
@@ -1002,6 +1068,7 @@ add_repo_key() {
 
 # 0. After copying the live system: turn it into a normal installed system.
 if [[ "$INSTALL_METHOD" == copy ]]; then
+    progress "Removing the live system's own settings."
     echo "Removing the live system's own settings..."
     # Every file the live ISO added on top of its packages (written by
     # scripts/build-iso.sh). The installer writes the real versions below.
@@ -1040,6 +1107,7 @@ if [[ "$INSTALL_METHOD" == copy ]]; then
 fi
 
 # 1. Timezone, clock, and locale
+progress "Setting the time zone and language."
 ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
 [[ "$QUICK_TEST" == "y" ]] || hwclock --systohc
 
@@ -1051,6 +1119,7 @@ echo "$HOSTNAME" > /etc/hostname
 echo "KEYMAP=$CONSOLE_KEYMAP" > /etc/vconsole.conf
 
 # 2. Pacman tuning, multilib (required for Wine), and automatic maintenance timers
+progress "Updating the system."
 sed -i 's/^#Color/Color/' /etc/pacman.conf
 sed -i 's/^#\?ParallelDownloads.*/ParallelDownloads = 5/' /etc/pacman.conf
 sed -i '/^#\[multilib\]/,/^#Include = \/etc\/pacman.d\/mirrorlist/ s/^#//' /etc/pacman.conf
@@ -1083,6 +1152,7 @@ GNOME_ACCESSIBILITY=1
 A11Y_ENV
 
 # 5. User accounts and sudoers
+progress "Creating your user account."
 echo "root:$ROOT_PASSWORD" | chpasswd
 # The audio group lets this user's PipeWire reach the sound card at boot,
 # before anyone logs in, so console speech works (see step 9).
@@ -1093,6 +1163,7 @@ echo "%wheel ALL=(ALL:ALL) ALL" > /etc/sudoers.d/10-wheel
 chmod 0440 /etc/sudoers.d/10-wheel
 
 # 6. XLibre repository and display server
+progress "Adding package repositories and the X server."
 add_repo_key xlibre-archlinux.asc https://xlibre-arch.github.io/xlibre-archlinux.asc \
     0C92313001CFCA27627B9098B97F7C613F359424 || { echo "Error: could not add the XLibre signing key." >&2; exit 1; }
 
@@ -1181,6 +1252,7 @@ EndSection
 XKB
 
 # 7. Modern GPU, network, and virtualization driver detection
+progress "Setting up drivers for this computer."
 pac_install pciutils
 gpu_info=$(lspci -nn | grep -Ei 'VGA|3D|Display' || true)
 # nvidia-open only supports Turing (RTX 20 / GTX 16) and newer chips:
@@ -1223,6 +1295,7 @@ if grep -qi microsoft /sys/class/dmi/id/sys_vendor 2>/dev/null; then
 fi
 
 # 7b. GRUB boot loader
+progress "Installing the boot loader."
 # Installed before the desktop and AUR steps, so a later problem cannot
 # leave the computer unable to boot.
 if [[ "$SERIAL_CONSOLE" == "y" ]]; then
@@ -1250,6 +1323,7 @@ fi
 [[ "$QUICK_TEST" == "y" ]] || grub-mkconfig -o /boot/grub/grub.cfg
 
 # 8. SonicDE desktop and full application suite
+progress "Installing the SonicDE desktop and apps. This is the longest part."
 pac_install "${SONA_DESKTOP_PKGS[@]}"
 install_optional "${SONA_APP_PKGS[@]}"
 install_optional "${SONA_KOKORO_PKGS[@]}"
@@ -1257,6 +1331,7 @@ install_optional "${SONA_KOKORO_PKGS[@]}"
 install_optional "${SONA_STORMUX_PKGS[@]}"
 
 # 9. Core services, Printing, Timeshift, Bluetooth, Flathub, and Speech
+progress "Setting up speech, sound, printing, and Bluetooth."
 # There is no graphical login manager: you log in at the talking text
 # console (or automatically), and the desktop starts from there (step 11).
 systemctl enable \
@@ -1338,6 +1413,7 @@ pref("mail.tabs.autoHide", true);
 TBPREF
 
 # 11. Login: talking console on tty1, then SonicDE with Orca.
+progress "Setting up the login and Orca."
 # Speakup (espeakup) talks at the console login. When you log in on tty1,
 # ~/.bash_profile stops espeakup so it never talks over Orca, starts the
 # desktop, and starts espeakup again when the desktop closes.
@@ -1433,6 +1509,7 @@ X-KDE-Shortcuts=Meta+Alt+S
 ORCA_RESTART
 
 # 13. Install yay and AUR packages (Chrome, Pamac, Thorium, RHVoice, OCR tools)
+progress "Installing extra apps from the AUR, like Google Chrome. This can take a while."
 # AUR problems must never stop the install, so every step here is allowed to fail.
 if [[ "$INSTALL_AUR" == "y" && "$ONLINE" != y ]]; then
     echo "No internet: skipping AUR apps (Google Chrome, Pamac, Thorium, RHVoice). Firefox is the web browser."
@@ -1534,7 +1611,15 @@ Categories=Utility;Accessibility;
 X-KDE-Shortcuts=Meta+Alt+O
 SONA_OCR_DESKTOP
 
+# SonicDE only registers X-KDE-Shortcuts from menu files linked into
+# /usr/share/kglobalaccel, so link Sona's own.
+mkdir -p /usr/share/kglobalaccel
+for app in sona-orca-restart sona-ai sona-ocr; do
+    ln -sfn "/usr/share/applications/$app.desktop" "/usr/share/kglobalaccel/$app.desktop"
+done
+
 # 16. Populate Desktop Icons for User and /etc/skel (Ready for Live ISO too)
+progress "Adding desktop icons and default apps."
 # Google Chrome comes from the AUR (step 13). Without it (no internet, or
 # the AUR step skipped), Firefox is the web browser.
 if pacman -Q google-chrome >/dev/null 2>&1; then
@@ -1717,6 +1802,7 @@ MIMEAPPS
 cp /etc/xdg/mimeapps.list "/home/$USERNAME/.config/mimeapps.list"
 
 # 18. First-login helper: desktop icons, volume, login sound, XP theme
+progress "Setting up Orca Bridge, Kokoro voices, and first-login settings."
 if [[ "$XP_THEME" == "y" && -d /root/sona-extras/xp-theme ]]; then
     # Packages the Windows XP sound scripts need. The sounds themselves are
     # downloaded from archive.org at first login (see sona-session-init).
@@ -1757,6 +1843,7 @@ if [[ -x /root/sona-extras/kokoro/sona-kokoro-setup ]]; then
     sona-kokoro-setup || echo "Warning: Kokoro voices could not be set up now. Run: sudo sona-kokoro-setup"
 fi
 
+progress "Building the OpenEVV voice from source. This takes a few minutes."
 # OpenEVV (IBM ViaVoice / Eloquence), the default voice. Its language data
 # is IBM's, so it is built here from source rather than shipped. The timer
 # retries at every boot until it works (for installs with no internet) and
@@ -1845,6 +1932,7 @@ fi
 chown -R "$USERNAME:$USERNAME" "/home/$USERNAME"
 
 # 19. Refresh the boot menu now that everything is installed, so it also
+progress "Finishing the boot menu."
 # lists Windows or other systems found by os-prober. GRUB itself was
 # installed earlier, so a failure here still leaves a bootable system.
 [[ "$QUICK_TEST" == "y" ]] || grub-mkconfig -o /boot/grub/grub.cfg || echo "Warning: could not refresh the GRUB menu. Run grub-mkconfig -o /boot/grub/grub.cfg after reboot."
@@ -1869,11 +1957,30 @@ elif ! curl -fsSL "https://github.com/chasecichorz/sona/archive/refs/heads/main.
 fi
 [[ "$XP_THEME" == "y" ]] || rm -rf /mnt/root/sona-extras/xp-theme /mnt/root/sona-extras/xp-sounds
 
-echo "Configuring Sona Linux inside chroot..."
-arch-chroot /mnt /root/setup-chroot.sh
+step "Setting up the new system" "Starting."
+# The setup script prints "@@STEP text" at each part; those update the
+# status box, and everything goes to the log.
+# (The exit code goes through a file: a failing pipeline would otherwise
+# trigger the error trap before it could be read.)
+rc_file=$(mktemp)
+{ arch-chroot /mnt /root/setup-chroot.sh; echo $? > "$rc_file"; } 2>&1 | tee -a "$LOG" | while IFS= read -r line; do
+    if [[ "$line" == "@@STEP "* ]]; then
+        show_progress "Setting up the new system" "${line#@@STEP }"
+    elif [[ "$QUIET" != yes ]]; then
+        printf '%s\n' "$line"
+    fi
+done || true
+chroot_rc=$(cat "$rc_file" 2>/dev/null || echo 1)
+rm -f "$rc_file"
+if [[ "$chroot_rc" -ne 0 ]]; then
+    err "Setting up the new system failed (exit code $chroot_rc)."
+fi
 
 rm -f /mnt/root/setup-chroot.sh /mnt/root/install.conf
+# Keep the install log on the new system. It has no passwords in it.
+cp "$LOG" /mnt/var/log/sona-install.log 2>/dev/null || true
 
+step "Finishing" "Unmounting the new system."
 umount -R /mnt
 MOUNTED=false
 

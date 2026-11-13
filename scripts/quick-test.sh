@@ -265,6 +265,7 @@ check "Welcome Center does not pop up" has /etc/xdg/kded6rc 'autoload=false'
 check "Sona AI has its shortcut" has /usr/share/applications/sona-ai.desktop 'X-KDE-Shortcuts=Meta+Alt+H'
 check "OCR has its shortcut" has /usr/share/applications/sona-ocr.desktop 'X-KDE-Shortcuts=Meta+Alt+O'
 check "Restart Orca has its shortcut" has /usr/share/applications/sona-orca-restart.desktop 'X-KDE-Shortcuts=Meta+Alt+S'
+check "SonicDE registers Sona's shortcuts" test -L "$root/usr/share/kglobalaccel/sona-ai.desktop" -a -L "$root/usr/share/kglobalaccel/sona-ocr.desktop" -a -L "$root/usr/share/kglobalaccel/sona-orca-restart.desktop"
 check "no MATE commands left in menu files" bash -c "! grep -rl 'mate-terminal' '$root/usr/share/applications' '$root/home/$user/Desktop'"
 check "desktop icons are in place" test -f "$root/home/$user/Desktop/Word Processor.desktop"
 approved() {  # extension folder name
