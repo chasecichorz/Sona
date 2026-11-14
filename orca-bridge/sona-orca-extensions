@@ -32,6 +32,10 @@ if [[ "${1:-}" == "--refresh" ]]; then
     refresh=yes
     shift
 fi
+# For yourself (no HOME_DIR given) the approval goes through your running
+# session; for a given home folder the dconf database file is written.
+self=no
+[[ $# -eq 0 ]] && self=yes
 home="${1:-$HOME}"
 owner="${2:-}"
 ext="$home/.local/share/orca/extensions"
@@ -92,7 +96,7 @@ wanted="$(for name in "${!approve[@]}"; do printf '%s %s\n' "$name" "${approve[$
 
 changed=no
 db="$home/.config/dconf/user"
-if [[ -z "$owner" && -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] && command -v dconf >/dev/null; then
+if [[ "$self" == yes && -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] && command -v dconf >/dev/null; then
     # In your own session: merge into whatever is already approved.
     current="$(dconf read "$KEY" 2>/dev/null || true)"
     new="$(python3 - "$current" "$wanted" <<'PY'

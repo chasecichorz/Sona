@@ -221,7 +221,9 @@ if [[ "$online" == n ]]; then
     # A new, empty network namespace: truly no internet inside.
     unshare -n arch-chroot "$root" /root/setup-chroot.sh 2>&1 | tee "$log"
 else
-    arch-chroot "$root" /root/setup-chroot.sh 2>&1 | tee "$log"
+    # A session bus address that leads nowhere, as a root console login on
+    # the live ISO has; helpers must not try to use it.
+    DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent arch-chroot "$root" /root/setup-chroot.sh 2>&1 | tee "$log"
 fi
 setup_rc=${PIPESTATUS[0]}
 set -e
