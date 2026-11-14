@@ -1,0 +1,6 @@
+#!/bin/bash
+# Run by getty@tty1 on the live ISO (see its autologin.conf drop-in).
+if grep -qw sona.console /proc/cmdline; then
+    exec /usr/bin/agetty --noreset --noclear --autologin root - "${TERM:-linux}"
+fi
+exec /usr/bin/agetty -o '-p -f -- \u' --noreset --noclear --autologin sona - "${TERM:-linux}"

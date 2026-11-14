@@ -61,9 +61,29 @@ everything:
   autologin, the drop-in needs `-o '-p -f -- \\u'`), then `~/.bash_profile`
   stops espeakup, runs `startx`, and restarts espeakup when X exits.
   `/etc/sudoers.d/20-sona-espeakup` allows that without a password.
-- **Live ISO:** LightDM autologin as user `sona` (session `sonicde`). The
-  "console with speech" boot entry passes `systemd.unit=multi-user.target`,
-  because lightdm.service conflicts with getty@tty1.
+- **Live ISO:** logs in like an installed system, no LightDM: getty@tty1 runs
+  `/usr/local/bin/sona-live-getty`, which autologins `sona` (whose
+  `~/.bash_profile` runs startx) or, with `sona.console` (the "console with
+  speech" entry and the CI install test), root with the archiso automated
+  script. archiso copies the image to RAM by itself when it fits
+  (`copytoram=auto`); boot entries also offer `copytoram=y` and `copytoram=n`.
+  Then the image is `/run/archiso/copytoram/airootfs.sfs` and the USB is
+  unmounted; the installer handles both.
+- **Installer UI:** plain text, inspired by the Stormux installer
+  (`install-stormux` in git.stormux.org/storm/stormux): numbered menus
+  (`ui_menu`), yes/no (`ui_yesno`, `ui_yesno_default_no`), typed YES for
+  erasing (`ui_confirm_yes`), Ctrl+C quits. Prompts go to stderr because
+  answers come back through `$(...)`; each `$(ask ...)` needs `|| exit 130`
+  (command substitutions do not inherit errexit). All choices are made
+  first, then a summary, then YES, then the disks change. Noisy output goes
+  to `/var/log/sona-install.log`; the screen gets "Step N of 5" lines.
+- **Installer features:** disk layouts `erase`, `erase_home`, `home_disk`,
+  `existing`, `mounted`; extra users (`EXTRA_USERS` etc., created last from
+  /etc/skel) with admin choice and `AUTOLOGIN_USER`; extras `GAME_MANAGER`,
+  `AUDIOGAME_MANAGER` (git clones in /opt, group games, like Stormux),
+  `STEAM`, `SSH`; the live user's Orca dconf settings are saved to
+  `orca-settings.ini` and compiled into every new account (via
+  `SONA_DCONF_EXTRA` in `sona-orca-extensions`); a sox chord at the end.
 - **Two install methods** (`INSTALL_METHOD`):
   - `copy` — from the Sona ISO. unsquashfs the live image to the disk, put
     back `/boot` from `/usr/share/sona/boot`, delete every file listed in

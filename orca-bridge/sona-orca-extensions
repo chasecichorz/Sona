@@ -8,6 +8,9 @@
 #
 # Usage:
 #   sona-orca-extensions                    for yourself, in your session
+#   SONA_DCONF_EXTRA=FILE sona-orca-extensions HOME_DIR [OWNER]
+#                                           also start the new home with the
+#                                           dconf keyfile FILE (Orca settings)
 #   sona-orca-extensions --refresh          the same, quietly; restarts Orca
 #                                           only if an approval changed
 #                                           (run at login by sona-session-init)
@@ -115,6 +118,11 @@ elif [[ ! -f "$db" ]]; then
         echo "$wanted" | awk '{printf "%s\047%s\047: \047%s\047", (NR > 1 ? ", " : ""), $1, $2}'
         echo "}"
     } > "$keyfiles/orca-extensions"
+    # Extra Orca settings to start with (Install passes the live system's
+    # voice and speech settings this way).
+    if [[ -n "${SONA_DCONF_EXTRA:-}" && -s "$SONA_DCONF_EXTRA" ]]; then
+        cp "$SONA_DCONF_EXTRA" "$keyfiles/00-orca-settings"
+    fi
     mkdir -p "$home/.config/dconf"
     dconf compile "$db" "$keyfiles"
     rm -rf "$keyfiles"

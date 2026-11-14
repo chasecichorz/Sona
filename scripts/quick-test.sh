@@ -183,6 +183,15 @@ GRUB_REMOVABLE=no
 INSTALL_AUR=n
 SERIAL_CONSOLE=n
 QUICK_TEST=y
+AUTOLOGIN_USER=$user
+EXTRA_USERS=(helper)
+EXTRA_FULLNAMES=('Sona Helper')
+EXTRA_PASSWORDS=(helper-pass)
+EXTRA_ADMINS=(y)
+GAME_MANAGER=$online
+AUDIOGAME_MANAGER=n
+STEAM=n
+SSH=y
 INSTALL_METHOD=$method
 ONLINE=$online
 SONA_X_PKGS=(${SONA_X_PKGS[*]})
@@ -200,6 +209,8 @@ sed -n "/^cat << 'EOF' > \/mnt\/root\/setup-chroot.sh$/,/^EOF$/p" "$repo_dir/Ins
 chmod 755 "$root/root/setup-chroot.sh"
 
 mkdir -p "$root/root/sona-extras"
+# As if the live system's Orca had been set to a faster speech rate.
+printf '[org/gnome/orca/default/speech]\nrate=77\n' > "$root/root/sona-extras/orca-settings.ini"
 cp -r "$repo_dir/orca-bridge" "$repo_dir/kokoro" "$repo_dir/xp-theme" "$repo_dir/packages" "$root/root/sona-extras/"
 
 # --- 3. Run the setup, exactly as the installer does.
@@ -316,7 +327,8 @@ if [[ "$method" == copy ]]; then
     check "copy: live home folder is gone" test ! -e "$root/home/sona"
     check "copy: live sudo rule is gone" test ! -e "$root/etc/sudoers.d/10-sona-live"
     check "copy: live root auto-login is gone" test ! -e "$root/etc/systemd/system/getty@tty1.service.d/autologin.conf"
-    check "copy: live services are gone" bash -c "! ls '$root'/etc/systemd/system/multi-user.target.wants/ | grep -E 'livecd|sona-pick-sound|sona-live|choose-mirror|pacman-init|sshd|cloud|vbox|vmtoolsd|iwd|systemd-networkd'"
+    # (sshd is left out: this test turns SSH on.)
+    check "copy: live services are gone" bash -c "! ls '$root'/etc/systemd/system/multi-user.target.wants/ | grep -E 'livecd|sona-pick-sound|sona-live|choose-mirror|pacman-init|cloud|vbox|vmtoolsd|iwd|systemd-networkd'"
     check "copy: live boot hooks are gone" bash -c "! ls '$root'/etc/mkinitcpio.conf.d/archiso.conf && ! arch-chroot '$root' pacman -Q mkinitcpio-archiso"
     check "copy: cloud-init is not installed" bash -c "! arch-chroot '$root' pacman -Q cloud-init"
     check "copy: kernel is in /boot" test -s "$root/boot/vmlinuz-linux"
@@ -332,6 +344,19 @@ if [[ "$method" == copy ]]; then
     check "copy: new user can log in (password is set)" bash -c "grep -q '^$user:\\\$' '$root/etc/shadow'"
 fi
 check "OpenEVV update timer is on" in_root systemctl is-enabled sona-openevv-update.timer
+check "tty1 logs in the chosen user ($user)" has /etc/systemd/system/getty@tty1.service.d/10-sona-autologin.conf "--autologin $user "
+check "second user helper exists and is an administrator" bash -c "grep -q '^helper:' '$root/etc/passwd' && grep -q '^wheel:.*helper' '$root/etc/group'"
+check "second user helper has a password" bash -c "grep -q '^helper:\\\$' '$root/etc/shadow'"
+check "second user has the login files and desktop icons" test -f "$root/home/helper/.bash_profile" -a -x "$root/home/helper/.xinitrc" -a -d "$root/home/helper/Desktop"
+check "second user owns their home" bash -c "[[ -z \$(arch-chroot '$root' find /home/helper ! -user helper -print -quit) ]]"
+check "second user has Orca Bridge approved" in_root su - helper -c "XDG_RUNTIME_DIR=/tmp dconf read /org/gnome/orca/default/extensions/approved-user-extensions | grep -q remote"
+check "live Orca settings carried to $user" in_root su - "$user" -c "[[ \$(XDG_RUNTIME_DIR=/tmp dconf read /org/gnome/orca/default/speech/rate) == 77 ]]"
+check "live Orca settings carried to the second user" in_root su - helper -c "[[ \$(XDG_RUNTIME_DIR=/tmp dconf read /org/gnome/orca/default/speech/rate) == 77 ]]"
+check "SSH is turned on" in_root systemctl is-enabled sshd.service
+if [[ "$online" == y ]]; then
+    check "Linux Game Manager is installed for the games group" bash -c "[[ -x '$root/usr/local/bin/linux-game-manager' && -d '$root/opt/linux-game-manager/.git' && \$(stat -c %G '$root/opt/linux-game-manager') == games ]]"
+    check "users are in the games group" bash -c "grep -q '^games:.*$user' '$root/etc/group' && grep -q '^games:.*helper' '$root/etc/group'"
+fi
 check "install passwords were removed" test ! -e "$root/root/install.conf"
 
 took=$(( $(date +%s) - start ))

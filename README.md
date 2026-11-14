@@ -36,11 +36,17 @@ are on by default; the installer asks, and you can choose No.
 
 ## The live ISO
 
-The boot menu has two main choices:
+The boot menu choices:
 
-- Sona Linux live desktop (the default). Logs in automatically to the SonicDE
-  desktop with Orca talking. Firefox is included for trying things out. The
-  "Install Sona Linux" icon on the desktop starts the installer.
+- Sona Linux live desktop (the default). Logs in automatically on tty1 and
+  starts the SonicDE desktop with Orca talking, the same way an installed
+  Sona system does. It loads itself into RAM when the computer has enough
+  memory (about 6 GB or more), so the USB drive can then be removed.
+- Sona Linux live desktop, load into RAM. Always copies the system into
+  memory first (needs about 8 GB of RAM); starting takes a minute or two
+  longer, then everything is fast.
+- Sona Linux live desktop, run from the USB drive. Never copies it into
+  memory; for computers with little RAM.
 - Sona Linux live console with speech. A text console with espeakup, for
   computers where the desktop does not work. Type `sona-install` to install.
 
@@ -51,8 +57,9 @@ each device in turn asks you to press Enter to use it. The one you choose is
 where Orca talks. Add `sona.nosoundpick` to the boot options to skip this. The volume is raised to 70% at login.
 The desktop has a network icon for Wi-Fi.
 
-The live desktop uses the standard Arch X server; installed systems use
-XLibre. The live user is `sona`, with no password and full sudo access.
+The live desktop and installed systems both use XLibre and the same login
+(tty1, then startx). There is no graphical login screen. The live user is
+`sona`, with no password and full sudo access.
 
 ## Installing
 
@@ -67,7 +74,26 @@ From a standard Arch Linux ISO, connect to the internet, then run:
     bash Install
 
 The installer asks its questions first and changes nothing on disk until you
-confirm. Press Escape on any question to quit.
+have heard a summary of everything and typed YES. Every question is plain
+text, so a screen reader reads it line by line: for a list, type the number
+of your choice and press Enter; for yes or no questions type yes or no, and
+Enter alone takes the answer in brackets. Press Ctrl+C at any question to
+quit. While it works, it says one short line per step ("Step 3 of 5: ...")
+and keeps the details in `/var/log/sona-install.log`. A chord plays when it
+is done.
+
+It can also:
+
+- make more user accounts, each an administrator or not, and pick which one
+  (or none) logs in automatically;
+- install Linux Game Manager and Audiogame Manager (from Stormux), Steam,
+  and turn on SSH;
+- start every account with the Orca settings (voice, speech engine, rate)
+  you were using on the live system.
+
+Disk layouts: erase one drive; erase one drive with a separate /home
+partition; erase one drive for Sona and a second one for /home; dual boot
+onto one existing partition; or use partitions you mounted at /mnt yourself.
 
 ### No internet needed from the Sona ISO
 

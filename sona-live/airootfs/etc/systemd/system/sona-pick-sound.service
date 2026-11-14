@@ -2,7 +2,7 @@
 Description=Announce Sona starting and let the user pick a sound device
 # Runs once the sound cards are ready and before the desktop takes them over.
 After=sound.target livecd-alsa-unmuter.service systemd-udev-settle.service
-Before=display-manager.service
+Before=getty@tty1.service
 ConditionKernelCommandLine=!sona.console
 
 [Service]
@@ -13,6 +13,8 @@ StandardInput=tty
 StandardOutput=journal
 ExecStartPre=/usr/bin/chvt 12
 ExecStart=/usr/local/bin/sona-pick-sound
+# Back to tty1, where the desktop starts.
+ExecStartPost=/usr/bin/chvt 1
 TTYVHangup=yes
 TimeoutStartSec=180
 

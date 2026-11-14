@@ -13,13 +13,16 @@
 
 set -Eeuo pipefail
 
-BACKTITLE="Sona Linux Accessible Installer"
 SELECTED_SSID=""
 WIFI_PASS=""
 MOUNTED=false
 UNATTENDED=no
 ANSWER_FILE=""
 declare -A ANS=()
+EXTRA_USERS=()
+EXTRA_FULLNAMES=()
+EXTRA_PASSWORDS=()
+EXTRA_ADMINS=()
 
 # BEGIN SONA PACKAGES
 # Every package Sona installs. scripts/build-iso.sh reads this block too, so
@@ -102,20 +105,11 @@ step() {
 }
 
 # show_progress TITLE [DETAIL]: show the current step again with new detail.
+# One plain line, so a screen reader reads just that.
 show_progress() {
     local msg="Step $STEP_NUM of $STEP_TOTAL: $1"
     printf '\n== %s%s\n' "$msg" "${2:+ - $2}" >> "$LOG"
-    if [[ "$QUIET" == yes ]]; then
-        clear
-        whiptail --backtitle "$BACKTITLE" --title "Installing Sona Linux" \
-            --infobox "$msg
-
-${2:-This can take a while.}
-
-Details are saved in $LOG." 12 74
-    else
-        printf '\n== %s%s\n' "$msg" "${2:+ - $2}"
-    fi
+    printf '\n%s%s\n' "$msg" "${2:+. $2}" >&2
 }
 
 # quietly COMMAND...: run a noisy command, its output going to the log.
@@ -132,17 +126,16 @@ quietly() {
 show_failure() {
     local msg="$1"
     echo "Error: $msg" >> "$LOG"
-    if [[ "$QUIET" == yes ]] && command -v whiptail >/dev/null 2>&1; then
-        clear
-        whiptail --backtitle "$BACKTITLE" --title "Installation Stopped" --scrolltext --msgbox "$msg
-
-The last lines of the install log ($LOG) are below. Use the arrow keys to read them, then press Enter.
-
-$(tail -n 25 "$LOG" 2>/dev/null)" 22 78 || true
-        clear
-    fi
-    echo "Error: $msg" >&2
-    echo "The full install log is in $LOG." >&2
+    {
+        echo
+        echo "Installation stopped. $msg"
+        if [[ "$QUIET" == yes && -s "$LOG" ]]; then
+            echo
+            echo "The last lines of the install log follow. The whole log is in $LOG."
+            tail -n 25 "$LOG"
+            echo "End of the log lines."
+        fi
+    } >&2
 }
 
 # Exit code 130 means the user cancelled a dialog; that is not an error.
@@ -172,22 +165,159 @@ err() {
 }
 
 user_cancelled() {
-    clear
-    echo "Installer cancelled." >&2
+    echo "Installer cancelled. Nothing was changed on any disk." >&2
     exit 130
 }
 
+# Ctrl+C: before any disk is touched, just quit; afterwards, clean up.
+on_interrupt() {
+    if [[ "$MOUNTED" == true ]]; then
+        err "Installation cancelled with Ctrl+C. The disk was already changed, so run the installer again to finish."
+    fi
+    echo >&2
+    user_cancelled
+}
+trap on_interrupt INT
+
 # ---------------------------------------------------------------------------
-# Dialog helpers
-# Pressing Cancel or Escape in any input or menu quits the installer cleanly.
+# Question helpers
+# Every question is plain text in the terminal, so a screen reader reads it
+# line by line: menus are numbered (type the number and press Enter), yes or
+# no questions take "yes" or "no", and Enter alone takes the default shown
+# in brackets. Press Ctrl+C at any question to quit before any disk is changed.
+# Questions and messages go to stderr, because answers are read with $(...).
 # ---------------------------------------------------------------------------
+
+heading() {
+    printf '\n=== %s ===\n' "$1" >&2
+}
+
+# ask PROMPT: read one line from the keyboard. End of input quits.
+ask() {
+    local reply
+    if ! IFS= read -r -p "$1" reply; then
+        echo >&2
+        user_cancelled
+    fi
+    printf '%s' "$reply"
+}
 
 ui_msg() {
     if [[ "$UNATTENDED" == yes ]]; then
         printf '\n== %s\n%s\n' "$1" "$2"
         return 0
     fi
-    whiptail --backtitle "$BACKTITLE" --title "$1" --msgbox "$2" 14 74
+    heading "$1"
+    printf '%s\n' "$2" >&2
+    ask "Press Enter to continue. " > /dev/null || exit 130
+}
+
+# ui_input TITLE PROMPT [DEFAULT]
+ui_input() {
+    local title="$1" prompt="$2" default="${3:-}" out
+    heading "$title"
+    printf '%s\n' "$prompt" >&2
+    if [[ -n "$default" ]]; then
+        out=$(ask "Type your answer, or press Enter for $default: ") || exit 130
+        [[ -n "$out" ]] || out="$default"
+    else
+        out=$(ask "Type your answer and press Enter: ") || exit 130
+    fi
+    printf '%s' "$out"
+}
+
+# ui_pass TITLE PROMPT: nothing is shown or spoken while typing.
+ui_pass() {
+    local title="$1" prompt="$2" out
+    heading "$title"
+    printf '%s\n' "$prompt" >&2
+    if ! IFS= read -r -s -p "Type it and press Enter. It is not shown or spoken: " out; then
+        echo >&2
+        user_cancelled
+    fi
+    echo >&2
+    printf '%s' "$out"
+}
+
+# ui_menu TITLE PROMPT TAG ITEM [TAG ITEM ...]: prints the chosen TAG.
+ui_menu() {
+    local title="$1" prompt="$2" out i
+    shift 2
+    local -a tags=() items=()
+    while [[ $# -ge 2 ]]; do
+        tags+=("$1")
+        items+=("$2")
+        shift 2
+    done
+    heading "$title"
+    printf '%s\n' "$prompt" >&2
+    for i in "${!tags[@]}"; do
+        printf '  %s. %s\n' "${tags[$i]}" "${items[$i]}" >&2
+    done
+    while true; do
+        out=$(ask "Type a number and press Enter: ") || exit 130
+        out="${out//[[:space:]]/}"
+        for i in "${tags[@]}"; do
+            if [[ "$out" == "$i" ]]; then
+                printf '%s' "$out"
+                return 0
+            fi
+        done
+        printf 'Please type one of the numbers listed, from %s to %s.\n' "${tags[0]}" "${tags[-1]}" >&2
+    done
+}
+
+# yes_no_prompt DEFAULT(y|n): prints y or n.
+yes_no_prompt() {
+    local default="$1" out hint
+    [[ "$default" == y ]] && hint="yes" || hint="no"
+    while true; do
+        out=$(ask "Type yes or no, or press Enter for $hint: ") || exit 130
+        case "${out,,}" in
+            "") echo "$default"; return 0 ;;
+            y|yes) echo "y"; return 0 ;;
+            n|no) echo "n"; return 0 ;;
+        esac
+        echo "Please type yes or no." >&2
+    done
+}
+
+# ui_yesno TITLE TEXT: Enter means yes.
+ui_yesno() {
+    heading "$1"
+    printf '%s\n' "$2" >&2
+    yes_no_prompt y
+}
+
+# Same as ui_yesno, but Enter means no. In unattended mode the answer
+# file's CONFIRM_ERASE=yes (checked before any disk is touched) is the
+# confirmation.
+ui_yesno_default_no() {
+    if [[ "$UNATTENDED" == yes ]]; then
+        echo "y"
+        return 0
+    fi
+    heading "$1"
+    printf '%s\n' "$2" >&2
+    yes_no_prompt n
+}
+
+# ui_confirm_yes TITLE TEXT: for erasing disks. Only YES, typed in capital
+# letters, continues. Prints y or n.
+ui_confirm_yes() {
+    if [[ "$UNATTENDED" == yes ]]; then
+        echo "y"
+        return 0
+    fi
+    local out
+    heading "$1"
+    printf '%s\n' "$2" >&2
+    out=$(ask "Type YES in capital letters and press Enter to continue, or anything else to cancel: ") || exit 130
+    if [[ "$out" == "YES" ]]; then
+        echo "y"
+    else
+        echo "n"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -196,7 +326,7 @@ ui_msg() {
 # wrapped in single or double quotes. The file is read, never run.
 # ---------------------------------------------------------------------------
 
-ANSWER_KEYS=" DISK PART_MODE CONFIRM_ERASE ROOT_PART EFI_PART FULLNAME USERNAME PASSWORD ROOT_PASSWORD HOSTNAME TIMEZONE LANG_LOCALE CONSOLE_KEYMAP X11_KEYBOARD AUTOLOGIN XP_THEME INSTALL_METHOD WIFI_SSID WIFI_PASS INSTALL_AUR SERIAL_CONSOLE FINISH "
+ANSWER_KEYS=" DISK PART_MODE CONFIRM_ERASE ROOT_PART EFI_PART HOME_DISK ROOT_SIZE_GB EXTRA_USERS EXTRA_PASSWORD AUTOLOGIN_USER GAME_MANAGER AUDIOGAME_MANAGER STEAM SSH FULLNAME USERNAME PASSWORD ROOT_PASSWORD HOSTNAME TIMEZONE LANG_LOCALE CONSOLE_KEYMAP X11_KEYBOARD AUTOLOGIN XP_THEME INSTALL_METHOD WIFI_SSID WIFI_PASS INSTALL_AUR SERIAL_CONSOLE FINISH "
 
 load_answers() {
     local file="$1" line key val n=0
@@ -220,56 +350,6 @@ load_answers() {
 # ans KEY [DEFAULT]: the answer for KEY, or DEFAULT when it is not set.
 ans() {
     printf '%s' "${ANS[$1]:-${2:-}}"
-}
-
-ui_input() {
-    local title="$1" prompt="$2" default="${3:-}" out
-    if ! out=$(whiptail --backtitle "$BACKTITLE" --title "$title" --inputbox "$prompt" 10 74 "$default" 3>&1 1>&2 2>&3); then
-        user_cancelled
-    fi
-    printf '%s' "$out"
-}
-
-ui_pass() {
-    local title="$1" prompt="$2" out
-    if ! out=$(whiptail --backtitle "$BACKTITLE" --title "$title" --passwordbox "$prompt" 10 74 3>&1 1>&2 2>&3); then
-        user_cancelled
-    fi
-    printf '%s' "$out"
-}
-
-# ui_menu TITLE PROMPT TAG ITEM [TAG ITEM ...]
-ui_menu() {
-    local title="$1" prompt="$2" out
-    shift 2
-    if ! out=$(whiptail --backtitle "$BACKTITLE" --title "$title" --menu "$prompt" 20 76 10 "$@" 3>&1 1>&2 2>&3); then
-        user_cancelled
-    fi
-    printf '%s' "$out"
-}
-
-# Prints y or n. Escape counts as n.
-ui_yesno() {
-    if whiptail --backtitle "$BACKTITLE" --title "$1" --yesno "$2" 12 74; then
-        echo "y"
-    else
-        echo "n"
-    fi
-}
-
-# Same as ui_yesno, but No is selected by default. Use for anything destructive.
-# In unattended mode the answer file's CONFIRM_ERASE=yes (checked before any
-# disk is touched) is the confirmation.
-ui_yesno_default_no() {
-    if [[ "$UNATTENDED" == yes ]]; then
-        echo "y"
-        return 0
-    fi
-    if whiptail --backtitle "$BACKTITLE" --title "$1" --defaultno --yesno "$2" 14 74; then
-        echo "y"
-    else
-        echo "n"
-    fi
 }
 
 # Partition device name: /dev/sda + 2 = /dev/sda2, /dev/nvme0n1 + 2 = /dev/nvme0n1p2
@@ -315,17 +395,7 @@ if [[ "$UNATTENDED" == yes ]]; then
     QUIET=no
 fi
 
-# The stock Arch ISO does not include whiptail (package libnewt).
-# Unattended installs never show menus, so they do not need it.
-if [[ "$UNATTENDED" != yes ]] && ! command -v whiptail >/dev/null 2>&1; then
-    echo "Installing whiptail for the installer menus..."
-    if ! pacman -Sy --noconfirm --needed libnewt; then
-        err "Could not install whiptail. Connect to the internet first (for Wi-Fi run: iwctl station wlan0 connect YOUR-NETWORK), then run the installer again."
-    fi
-fi
-
 required_cmds=(lsblk sgdisk partprobe udevadm wipefs mkfs.fat mkfs.ext4 pacstrap arch-chroot genfstab findmnt)
-[[ "$UNATTENDED" == yes ]] || required_cmds+=(whiptail)
 for cmd in "${required_cmds[@]}"; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         err "Required command '$cmd' is missing."
@@ -344,7 +414,10 @@ fi
 #   copy      copy the Sona live system on this ISO to the disk. Fast, and
 #             works with no internet. Used when running from the Sona ISO.
 #   download  download every package (pacstrap). Used from a stock Arch ISO.
+# The live image is on the USB drive, or in RAM when the live system was
+# loaded into memory (copytoram; then the USB drive is no longer mounted).
 LIVE_IMAGE=/run/archiso/bootmnt/arch/x86_64/airootfs.sfs
+[[ -f "$LIVE_IMAGE" ]] || LIVE_IMAGE=/run/archiso/copytoram/airootfs.sfs
 if [[ -f "$LIVE_IMAGE" && -f /usr/share/sona/live-files.txt && -d /usr/share/sona/boot ]]; then
     INSTALL_METHOD=copy
 else
@@ -361,7 +434,7 @@ ui_msg "Welcome" "Welcome to the Sona Linux installer.
 
 This computer started in ${BOOT_MODE^^} mode, so Sona will be set up to boot the same way.
 
-Press Enter to continue. You can press Escape on any question to quit before any disk is changed."
+Questions are plain text. For a list, type the number of your choice and press Enter. For yes or no questions, type yes or no; Enter alone takes the answer in brackets. Press Ctrl+C at any question to quit. Nothing on any disk changes until you type YES to confirm."
 
 # ---------------------------------------------------------------------------
 # 2. Network and Wi-Fi setup
@@ -578,6 +651,33 @@ if [[ "$UNATTENDED" == yes ]]; then
     ROOT_PASSWORD=$(ans ROOT_PASSWORD "$PASSWORD")
     AUTOLOGIN=$(yes_or_no "$(ans AUTOLOGIN no)")
     XP_THEME=$(yes_or_no "$(ans XP_THEME yes)")
+    # EXTRA_USERS=name:admin,name2:user (admin or user); they share EXTRA_PASSWORD.
+    if [[ -n "$(ans EXTRA_USERS)" ]]; then
+        [[ -n "$(ans EXTRA_PASSWORD)" ]] || err "Answer file: EXTRA_USERS needs EXTRA_PASSWORD."
+        IFS=, read -r -a extra_specs <<< "$(ans EXTRA_USERS)"
+        for spec in "${extra_specs[@]}"; do
+            u="${spec%%:*}"; u="${u,,}"; role=user
+            [[ "$spec" == *:* ]] && role="${spec#*:}"
+            if ! valid_username "$u" || [[ "$u" == "$USERNAME" || " ${EXTRA_USERS[*]} " == *" $u "* ]]; then
+                err "Answer file: EXTRA_USERS has an invalid or repeated username: $u"
+            fi
+            EXTRA_USERS+=("$u")
+            EXTRA_FULLNAMES+=("$u")
+            EXTRA_PASSWORDS+=("$(ans EXTRA_PASSWORD)")
+            if [[ "$role" == admin ]]; then EXTRA_ADMINS+=(y); else EXTRA_ADMINS+=(n); fi
+        done
+    fi
+    AUTOLOGIN_USER=""
+    if [[ "$AUTOLOGIN" == y ]]; then
+        AUTOLOGIN_USER=$(ans AUTOLOGIN_USER "$USERNAME")
+        if [[ "$AUTOLOGIN_USER" != "$USERNAME" && " ${EXTRA_USERS[*]} " != *" $AUTOLOGIN_USER "* ]]; then
+            err "Answer file: AUTOLOGIN_USER $AUTOLOGIN_USER is not one of the users."
+        fi
+    fi
+    GAME_MANAGER=$(yes_or_no "$(ans GAME_MANAGER no)")
+    AUDIOGAME_MANAGER=$(yes_or_no "$(ans AUDIOGAME_MANAGER no)")
+    STEAM=$(yes_or_no "$(ans STEAM no)")
+    SSH=$(yes_or_no "$(ans SSH no)")
     TIMEZONE=$(ans TIMEZONE "UTC")
     valid_timezone "$TIMEZONE" || err "Answer file: TIMEZONE \"$TIMEZONE\" is not a known time zone."
     LANG_LOCALE=$(ans LANG_LOCALE "en_US.UTF-8")
@@ -625,9 +725,47 @@ Choose No to set a separate root password.") == "y" ]]; then
         done
     fi
 
-    AUTOLOGIN=$(ui_yesno "Automatic Login" "Log into the SonicDE desktop automatically on startup without asking for your password?
+    # More user accounts. $USERNAME is always an administrator.
+    while [[ $(ui_yesno_default_no "More Users" "Add another user account? So far there are ${#EXTRA_USERS[@]} besides $USERNAME.") == "y" ]]; do
+        extra_full=$(ui_input "New User" "Enter the full name for the new user:")
+        while true; do
+            extra_user=$(ui_input "New User" "Enter a lowercase username for ${extra_full:-the new user} (no spaces):")
+            extra_user="${extra_user,,}"
+            if valid_username "$extra_user" && [[ "$extra_user" != "$USERNAME" && " ${EXTRA_USERS[*]} " != *" $extra_user "* ]]; then
+                break
+            fi
+            ui_msg "Invalid Username" "That username is not valid or is already used. It must start with a letter and use only lowercase letters, numbers, underscores, or hyphens."
+        done
+        while true; do
+            extra_pass=$(ui_pass "New User" "Enter a password for $extra_user:")
+            extra_confirm=$(ui_pass "New User" "Confirm the password for $extra_user:")
+            [[ -n "$extra_pass" && "$extra_pass" == "$extra_confirm" ]] && break
+            ui_msg "Password Mismatch" "The passwords did not match or were blank. Please try again."
+        done
+        EXTRA_USERS+=("$extra_user")
+        EXTRA_FULLNAMES+=("${extra_full:-$extra_user}")
+        EXTRA_PASSWORDS+=("$extra_pass")
+        EXTRA_ADMINS+=("$(ui_yesno_default_no "Administrator" "Should $extra_user be an administrator, able to install software and change system settings with sudo?")")
+    done
+
+    AUTOLOGIN_USER=""
+    if [[ ${#EXTRA_USERS[@]} -eq 0 ]]; then
+        AUTOLOGIN=$(ui_yesno "Automatic Login" "Log $USERNAME into the SonicDE desktop automatically when the computer starts, without asking for the password?
 
 If you choose No, you log in at the talking text console, and the desktop starts with Orca as soon as you have logged in.")
+        [[ "$AUTOLOGIN" == y ]] && AUTOLOGIN_USER="$USERNAME"
+    else
+        login_menu=("1" "Nobody: everyone logs in at the talking text console" "2" "$USERNAME")
+        for i in "${!EXTRA_USERS[@]}"; do
+            login_menu+=("$((i + 3))" "${EXTRA_USERS[$i]}")
+        done
+        login_choice=$(ui_menu "Automatic Login" "Which user should log into the desktop automatically when the computer starts?" "${login_menu[@]}")
+        case "$login_choice" in
+            1) AUTOLOGIN=n ;;
+            2) AUTOLOGIN=y; AUTOLOGIN_USER="$USERNAME" ;;
+            *) AUTOLOGIN=y; AUTOLOGIN_USER="${EXTRA_USERS[$((login_choice - 3))]}" ;;
+        esac
+    fi
 
     # On by default (Yes is selected); choose No for the SonicDE sounds.
     XP_THEME=$(ui_yesno "Windows XP Sounds" "Make the desktop sound like Windows XP?
@@ -635,6 +773,11 @@ If you choose No, you log in at the talking text console, and the desktop starts
 This adds the Windows XP startup, logon, logoff, shutdown, window, notification, and USB device sounds, plus AutoPlay and Safely Remove Hardware. The sounds are downloaded from archive.org the first time you log in.
 
 Choose No to keep the standard SonicDE sounds.")
+
+    GAME_MANAGER=$(ui_yesno_default_no "Linux Game Manager" "Install Linux Game Manager? It installs and updates accessible games for Linux, from Stormux. It needs the internet.")
+    AUDIOGAME_MANAGER=$(ui_yesno_default_no "Audiogame Manager" "Install Audiogame Manager? It installs and runs Windows audio games through Wine, from Stormux. It needs the internet.")
+    STEAM=$(ui_yesno_default_no "Steam" "Install Steam, the game store?")
+    SSH=$(ui_yesno_default_no "SSH" "Turn on SSH, so you can log into this computer from another one over the network?")
 
     while true; do
         TZ_CHOICE=$(ui_menu "Time Zone" "Select your time zone:" \
@@ -675,10 +818,26 @@ fi
 # ---------------------------------------------------------------------------
 # 4. Disk selection and partitioning
 # ---------------------------------------------------------------------------
+# First every choice is made (nothing is changed); then a summary is shown and
+# YES must be typed; only then are disks changed (apply_disk_plan).
+#
+# Layouts (PART_MODE):
+#   erase       erase one drive and use it all for Sona
+#   erase_home  erase one drive: a root partition of ROOT_SIZE_GB, the rest /home
+#   home_disk   erase one drive for Sona and a second drive (HOME_DISK) for /home
+#   existing    dual boot: format one existing partition (ROOT_PART), keep the rest
+#   mounted     use file systems already mounted at /mnt (nothing is formatted)
 
-# Never offer the USB stick the installer is running from.
+# Never offer the USB stick the installer is running from. When the live
+# system was loaded into RAM the stick is no longer mounted, so it is found
+# by the ISO's UUID from the boot options.
 LIVE_DISK=""
-if live_src=$(findmnt -no SOURCE /run/archiso/bootmnt 2>/dev/null); then
+live_src=$(findmnt -no SOURCE /run/archiso/bootmnt 2>/dev/null || true)
+if [[ -z "$live_src" ]]; then
+    live_uuid=$(sed -n 's/.*archisosearchuuid=\([^ ]*\).*/\1/p' /proc/cmdline)
+    [[ -n "$live_uuid" ]] && live_src=$(blkid -U "$live_uuid" 2>/dev/null || true)
+fi
+if [[ -n "$live_src" ]]; then
     live_parent=$(lsblk -no PKNAME "$live_src" 2>/dev/null | head -n 1 || true)
     if [[ -n "$live_parent" ]]; then
         LIVE_DISK="/dev/$live_parent"
@@ -689,62 +848,126 @@ fi
 
 DISK_NAMES=()
 DISK_DESC=()
-disk_menu=()
-while read -r d_name d_type d_ro d_size d_model; do
+DISK_SIZE_GB=()
+while read -r d_name d_type d_ro d_bytes d_model; do
     [[ "$d_type" == "disk" ]] || continue
     [[ "$d_ro" == "0" ]] || continue
     [[ "$d_name" == "$LIVE_DISK" ]] && continue
     [[ "$d_name" == /dev/zram* ]] && continue
+    d_size=$(lsblk -dno SIZE "$d_name" | tr -d ' ')
     DISK_NAMES+=("$d_name")
     DISK_DESC+=("$d_name, $d_size, ${d_model:-unknown model}")
-    disk_menu+=("${#DISK_NAMES[@]}" "$d_name  $d_size  ${d_model:-unknown model}")
-done < <(lsblk -dnpo NAME,TYPE,RO,SIZE,MODEL)
-
-if [[ ${#DISK_NAMES[@]} -eq 0 ]]; then
-    err "No storage drives were found to install to."
-fi
-
-if [[ "$UNATTENDED" == yes ]]; then
-    want_disk=$(ans DISK)
-    [[ -n "$want_disk" ]] || err "Answer file: DISK is required (a path like /dev/sda, or auto)."
-    if [[ "$want_disk" == "auto" ]]; then
-        # "auto" is only allowed when there is exactly one possible drive,
-        # so an answer file can never pick the wrong one.
-        [[ ${#DISK_NAMES[@]} -eq 1 ]] || err "Answer file: DISK=auto needs exactly one drive, but ${#DISK_NAMES[@]} were found. Set DISK to a path."
-        disk_idx=1
-    else
-        disk_idx=""
-        for i in "${!DISK_NAMES[@]}"; do
-            [[ "${DISK_NAMES[$i]}" == "$want_disk" ]] && disk_idx=$((i + 1))
-        done
-        [[ -n "$disk_idx" ]] || err "Answer file: DISK $want_disk is not an available drive. Available: ${DISK_NAMES[*]}"
-    fi
-else
-    disk_idx=$(ui_menu "Select Installation Drive" "Choose the drive to install Sona Linux onto:" "${disk_menu[@]}")
-fi
-DISK="${DISK_NAMES[$((disk_idx - 1))]}"
-DISK_LABEL="${DISK_DESC[$((disk_idx - 1))]}"
-
-if [[ "$UNATTENDED" == yes ]]; then
-    case "$(ans PART_MODE erase)" in
-        erase) PART_MODE=1 ;;
-        existing) PART_MODE=2 ;;
-        *) err "Answer file: PART_MODE must be erase or existing." ;;
-    esac
-    [[ "$(ans CONFIRM_ERASE)" == "yes" ]] || err "Answer file: set CONFIRM_ERASE=yes to confirm that data will be erased on $DISK_LABEL."
-    echo "Installing to $DISK_LABEL (PART_MODE=$(ans PART_MODE erase))"
-else
-    PART_MODE=$(ui_menu "Partitioning Method" "How would you like to install onto $DISK_LABEL?" \
-        "1" "Erase the entire drive and set up Sona Linux automatically" \
-        "2" "Dual-boot: use a partition I already created for Sona")
-fi
+    DISK_SIZE_GB+=("$((d_bytes / 1000000000))")
+done < <(lsblk -dbnpo NAME,TYPE,RO,SIZE,MODEL)
 
 EFI_PART=""
+HOME_PART=""
+HOME_DISK=""
+ROOT_SIZE_GB=""
 GRUB_REMOVABLE="no"
 ESP_TYPE="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
 BIOS_BOOT_TYPE="21686148-6449-6e6f-744e-656564454649"
 
-if [[ "$PART_MODE" == "2" ]]; then
+# pick_disk TITLE PROMPT [SKIP_DISK]: prints the index (0-based) of the chosen disk.
+pick_disk() {
+    local title="$1" prompt="$2" skip="${3:-}" i n=0
+    local -a menu=() idx=()
+    for i in "${!DISK_NAMES[@]}"; do
+        [[ "${DISK_NAMES[$i]}" == "$skip" ]] && continue
+        n=$((n + 1))
+        menu+=("$n" "${DISK_DESC[$i]}")
+        idx+=("$i")
+    done
+    [[ $n -gt 0 ]] || err "No other storage drive was found."
+    local choice
+    choice=$(ui_menu "$title" "$prompt" "${menu[@]}") || exit 130
+    printf '%s' "${idx[$((choice - 1))]}"
+}
+
+# disk_index_of PATH: prints the index of a disk path, or fails.
+disk_index_of() {
+    local i
+    for i in "${!DISK_NAMES[@]}"; do
+        [[ "${DISK_NAMES[$i]}" == "$1" ]] && { printf '%s' "$i"; return 0; }
+    done
+    return 1
+}
+
+if [[ "$UNATTENDED" == yes ]]; then
+    PART_MODE=$(ans PART_MODE erase)
+    case "$PART_MODE" in
+        erase|erase_home|home_disk|existing|mounted) ;;
+        *) err "Answer file: PART_MODE must be erase, erase_home, home_disk, existing, or mounted." ;;
+    esac
+else
+    PART_MODE=$(ui_menu "Disk Layout" "How should Sona use the disks? Nothing is changed until you have checked a summary and typed YES." \
+        "1" "Erase one drive and use all of it for Sona" \
+        "2" "Erase one drive, with a separate partition for your files (/home)" \
+        "3" "Erase one drive for Sona and a second drive for your files (/home)" \
+        "4" "Dual boot: install onto one partition you already made, keeping everything else" \
+        "5" "Advanced: use partitions you have already mounted at /mnt")
+    case "$PART_MODE" in
+        1) PART_MODE=erase ;;
+        2) PART_MODE=erase_home ;;
+        3) PART_MODE=home_disk ;;
+        4) PART_MODE=existing ;;
+        5) PART_MODE=mounted ;;
+    esac
+fi
+
+if [[ "$PART_MODE" != mounted ]]; then
+    [[ ${#DISK_NAMES[@]} -gt 0 ]] || err "No storage drives were found to install to."
+    if [[ "$UNATTENDED" == yes ]]; then
+        want_disk=$(ans DISK)
+        [[ -n "$want_disk" ]] || err "Answer file: DISK is required (a path like /dev/sda, or auto)."
+        if [[ "$want_disk" == "auto" ]]; then
+            # "auto" is only allowed when there is exactly one possible drive,
+            # so an answer file can never pick the wrong one.
+            [[ ${#DISK_NAMES[@]} -eq 1 ]] || err "Answer file: DISK=auto needs exactly one drive, but ${#DISK_NAMES[@]} were found. Set DISK to a path."
+            disk_i=0
+        else
+            disk_i=$(disk_index_of "$want_disk") || err "Answer file: DISK $want_disk is not an available drive. Available: ${DISK_NAMES[*]}"
+        fi
+    else
+        disk_i=$(pick_disk "Installation Drive" "Choose the drive to install Sona Linux onto:")
+    fi
+    DISK="${DISK_NAMES[$disk_i]}"
+    DISK_LABEL="${DISK_DESC[$disk_i]}"
+fi
+
+case "$PART_MODE" in
+erase_home)
+    disk_gb="${DISK_SIZE_GB[$disk_i]}"
+    max_root=$((disk_gb - 10))
+    default_root=80
+    [[ $default_root -gt $((disk_gb / 2)) ]] && default_root=$((disk_gb / 2))
+    [[ $max_root -ge 20 ]] || err "$DISK_LABEL is too small for a separate /home partition. Choose the whole-drive layout instead."
+    while true; do
+        if [[ "$UNATTENDED" == yes ]]; then
+            ROOT_SIZE_GB=$(ans ROOT_SIZE_GB "$default_root")
+        else
+            ROOT_SIZE_GB=$(ui_input "System Partition Size" "$DISK_LABEL holds about $disk_gb GB. How many GB should the system partition get? The rest, about $((disk_gb - default_root)) GB with the suggested size, becomes /home for your files. Use 20 to $max_root." "$default_root")
+        fi
+        if [[ "$ROOT_SIZE_GB" =~ ^[0-9]+$ && "$ROOT_SIZE_GB" -ge 20 && "$ROOT_SIZE_GB" -le "$max_root" ]]; then
+            break
+        fi
+        [[ "$UNATTENDED" == yes ]] && err "Answer file: ROOT_SIZE_GB must be a number from 20 to $max_root."
+        ui_msg "Size Not Possible" "Please type a whole number from 20 to $max_root."
+    done
+    ;;
+home_disk)
+    [[ ${#DISK_NAMES[@]} -ge 2 ]] || err "Only one drive was found, so /home cannot go on a second drive. Choose another layout."
+    if [[ "$UNATTENDED" == yes ]]; then
+        HOME_DISK=$(ans HOME_DISK)
+        home_i=$(disk_index_of "$HOME_DISK") || err "Answer file: HOME_DISK must be one of: ${DISK_NAMES[*]}"
+        [[ "$HOME_DISK" != "$DISK" ]] || err "Answer file: HOME_DISK must be a different drive from DISK."
+    else
+        home_i=$(pick_disk "Drive for Your Files" "Choose the second drive, for /home (your files). It will be erased too:" "$DISK")
+    fi
+    HOME_DISK="${DISK_NAMES[$home_i]}"
+    HOME_DISK_LABEL="${DISK_DESC[$home_i]}"
+    ;;
+existing)
     # --- EFI system partition (UEFI only) ---
     if [[ "$BOOT_MODE" == "uefi" ]]; then
         ESP_LIST=()
@@ -771,7 +994,6 @@ if [[ "$PART_MODE" == "2" ]]; then
             [[ " ${ESP_LIST[*]} " == *" $EFI_PART "* ]] || err "Answer file: EFI_PART $EFI_PART is not an EFI system partition. Found: ${ESP_LIST[*]}"
         elif [[ ${#ESP_LIST[@]} -eq 1 ]]; then
             EFI_PART="${ESP_LIST[0]}"
-            ui_msg "EFI Partition" "Sona will add its boot loader to the existing EFI partition $EFI_PART. It will not be formatted, and your other system's boot files will be kept."
         elif [[ "$UNATTENDED" == yes ]]; then
             err "Answer file: several EFI partitions were found (${ESP_LIST[*]}). Set EFI_PART to one of them."
         else
@@ -828,71 +1050,193 @@ if [[ "$PART_MODE" == "2" ]]; then
         ""|ext4|ext3|ext2|btrfs|xfs)
             ;;
         *)
-            if [[ $(ui_yesno_default_no "Existing Data Found" "$ROOT_PART contains a $root_fs file system. It may hold Windows or your personal files.
-
-Erasing it will destroy everything on it. Are you sure this is the right partition?") != "y" ]]; then
+            if [[ $(ui_yesno_default_no "Existing Data Found" "$ROOT_PART contains a $root_fs file system. It may hold Windows or your personal files. Erasing it destroys everything on it. Are you sure this is the right partition?") != "y" ]]; then
                 err "Installation cancelled by user."
             fi
             ;;
     esac
-
-    if [[ $(ui_yesno_default_no "Confirm Format" "Format $ROOT_PART as ext4 and install Sona Linux on it?
-
-Everything on $ROOT_PART will be permanently erased. Other partitions will not be touched.") != "y" ]]; then
-        err "Installation cancelled by user."
+    ;;
+mounted)
+    mountpoint -q /mnt || err "Nothing is mounted at /mnt. Mount the partition for Sona at /mnt (and, on UEFI computers, the EFI partition at /mnt/boot/efi), then run the installer again."
+    ROOT_PART=$(findmnt -no SOURCE /mnt)
+    root_parent=$(lsblk -no PKNAME "$ROOT_PART" 2>/dev/null | head -n 1 || true)
+    DISK="/dev/${root_parent:-${ROOT_PART#/dev/}}"
+    DISK_LABEL="$DISK"
+    if [[ "$BOOT_MODE" == "uefi" ]]; then
+        mountpoint -q /mnt/boot/efi || err "This is a UEFI computer, so the EFI partition must be mounted at /mnt/boot/efi before running the installer."
+        EFI_PART=$(findmnt -no SOURCE /mnt/boot/efi)
     fi
+    ;;
+esac
 
-    umount "$ROOT_PART" 2>/dev/null || true
-    swapoff "$ROOT_PART" 2>/dev/null || true
-    step "Preparing the disk" "Formatting $ROOT_PART."
-    quietly wipefs -af "$ROOT_PART"
-    quietly mkfs.ext4 -F -L SonaRoot "$ROOT_PART"
-else
-    if [[ $(ui_yesno_default_no "Confirm Drive Erase" "WARNING: Everything on this drive will be permanently erased:
+# ---------------------------------------------------------------------------
+# 4b. Summary: everything that will happen. Type YES to start.
+# ---------------------------------------------------------------------------
 
-$DISK_LABEL
+disk_layout_now() {  # DISK: its current partitions, for the summary
+    lsblk -o NAME,SIZE,FSTYPE,LABEL,MOUNTPOINTS "$1" 2>/dev/null | sed 's/^/    /'
+}
 
-Continue?") != "y" ]]; then
-        err "Installation cancelled by user."
-    fi
+summary="Sona Linux will be installed like this:
 
-    step "Preparing the disk" "Erasing and partitioning $DISK_LABEL."
+Computer name: $HOSTNAME
+User: $FULLNAME ($USERNAME), administrator"
+for i in "${!EXTRA_USERS[@]}"; do
+    [[ "${EXTRA_ADMINS[$i]}" == y ]] && role="administrator" || role="regular user"
+    summary+="
+User: ${EXTRA_FULLNAMES[$i]} (${EXTRA_USERS[$i]}), $role"
+done
+summary+="
+Automatic login: ${AUTOLOGIN_USER:-nobody}
+Time zone: $TIMEZONE. Language: $LANG_LOCALE. Keyboard: $X11_KEYBOARD
+Windows XP sounds: $([[ "$XP_THEME" == y ]] && echo yes || echo no)
+Linux Game Manager: $([[ "$GAME_MANAGER" == y ]] && echo yes || echo no). Audiogame Manager: $([[ "$AUDIOGAME_MANAGER" == y ]] && echo yes || echo no). Steam: $([[ "$STEAM" == y ]] && echo yes || echo no). SSH: $([[ "$SSH" == y ]] && echo yes || echo no)
+Install method: $([[ "$INSTALL_METHOD" == copy ]] && echo "copy this disc to the disk" || echo "download from the internet"). Internet: $([[ "$ONLINE" == y ]] && echo yes || echo no)
+"
+case "$PART_MODE" in
+    erase)
+        summary+="
+Disk: ERASE ALL OF $DISK_LABEL and use it for Sona.
+It holds now:
+$(disk_layout_now "$DISK")" ;;
+    erase_home)
+        summary+="
+Disk: ERASE ALL OF $DISK_LABEL. Sona gets $ROOT_SIZE_GB GB, and the rest becomes /home for your files.
+It holds now:
+$(disk_layout_now "$DISK")" ;;
+    home_disk)
+        summary+="
+Disks: ERASE ALL OF $DISK_LABEL for Sona, and ERASE ALL OF $HOME_DISK_LABEL for /home.
+$DISK holds now:
+$(disk_layout_now "$DISK")
+$HOME_DISK holds now:
+$(disk_layout_now "$HOME_DISK")" ;;
+    existing)
+        summary+="
+Disk: ERASE AND FORMAT $ROOT_PART only. Other partitions on $DISK are kept.${EFI_PART:+ The boot loader is added to $EFI_PART, which is not formatted.}
+$DISK holds now:
+$(disk_layout_now "$DISK")" ;;
+    mounted)
+        summary+="
+Disk: use what is mounted at /mnt ($ROOT_PART). Nothing is formatted." ;;
+esac
+
+if [[ "$UNATTENDED" == yes ]]; then
+    [[ "$(ans CONFIRM_ERASE)" == "yes" || "$PART_MODE" == mounted ]] || err "Answer file: set CONFIRM_ERASE=yes to confirm that data will be erased."
+    printf '\n%s\n' "$summary"
+    echo "$summary" >> "$LOG"
+elif [[ $(ui_confirm_yes "Ready to Install" "$summary
+
+Check the list above. To change anything, cancel now and run the installer again.") != "y" ]]; then
+    err "Installation cancelled. Nothing on any disk was changed."
+fi
+echo "$summary" >> "$LOG"
+
+# ---------------------------------------------------------------------------
+# 4c. Change the disks (only now)
+# ---------------------------------------------------------------------------
+
+release_disk() {  # DISK: unmount and turn off swap on all of its partitions
     while read -r p; do
         umount "$p" 2>/dev/null || true
         swapoff "$p" 2>/dev/null || true
-    done < <(lsblk -lnpo NAME "$DISK" | tail -n +2)
+    done < <(lsblk -lnpo NAME "$1" | tail -n +2)
+}
 
+case "$PART_MODE" in
+erase|erase_home)
+    step "Preparing the disk" "Erasing and partitioning $DISK_LABEL."
+    release_disk "$DISK"
     quietly wipefs -af "$DISK"
     quietly sgdisk --zap-all "$DISK"
     # 1: 1 MiB BIOS boot (lets GRUB boot on legacy BIOS)
     # 2: 1 GiB EFI system partition
-    # 3: Linux root, rest of the drive
+    # 3: Linux root (the rest, or ROOT_SIZE_GB)
+    # 4: /home (erase_home only: the rest)
+    if [[ "$PART_MODE" == erase ]]; then
+        quietly sgdisk \
+            -n 1:2048:+1M  -t 1:EF02 -c 1:BIOSBOOT \
+            -n 2:0:+1G     -t 2:EF00 -c 2:EFI \
+            -n 3:0:0       -t 3:8304 -c 3:SonaRoot \
+            "$DISK"
+    else
+        quietly sgdisk \
+            -n 1:2048:+1M  -t 1:EF02 -c 1:BIOSBOOT \
+            -n 2:0:+1G     -t 2:EF00 -c 2:EFI \
+            -n "3:0:+${ROOT_SIZE_GB}G" -t 3:8304 -c 3:SonaRoot \
+            -n 4:0:0       -t 4:8302 -c 4:SonaHome \
+            "$DISK"
+    fi
+    quietly partprobe "$DISK"
+    quietly udevadm settle
+    EFI_PART=$(part_path "$DISK" 2)
+    ROOT_PART=$(part_path "$DISK" 3)
+    wait_for_device "$EFI_PART"
+    wait_for_device "$ROOT_PART"
+    quietly mkfs.fat -F 32 -n EFI "$EFI_PART"
+    quietly mkfs.ext4 -F -L SonaRoot "$ROOT_PART"
+    if [[ "$PART_MODE" == erase_home ]]; then
+        HOME_PART=$(part_path "$DISK" 4)
+        wait_for_device "$HOME_PART"
+        quietly mkfs.ext4 -F -L SonaHome "$HOME_PART"
+    fi
+    # On a wiped drive it is safe to also install GRUB to the fallback EFI
+    # path, so firmware that forgets boot entries can still start Sona.
+    GRUB_REMOVABLE="yes"
+    ;;
+home_disk)
+    step "Preparing the disks" "Erasing and partitioning $DISK_LABEL and $HOME_DISK_LABEL."
+    release_disk "$DISK"
+    release_disk "$HOME_DISK"
+    quietly wipefs -af "$DISK"
+    quietly sgdisk --zap-all "$DISK"
     quietly sgdisk \
         -n 1:2048:+1M  -t 1:EF02 -c 1:BIOSBOOT \
         -n 2:0:+1G     -t 2:EF00 -c 2:EFI \
         -n 3:0:0       -t 3:8304 -c 3:SonaRoot \
         "$DISK"
+    quietly wipefs -af "$HOME_DISK"
+    quietly sgdisk --zap-all "$HOME_DISK"
+    quietly sgdisk -n 1:0:0 -t 1:8302 -c 1:SonaHome "$HOME_DISK"
     quietly partprobe "$DISK"
+    quietly partprobe "$HOME_DISK"
     quietly udevadm settle
-
     EFI_PART=$(part_path "$DISK" 2)
     ROOT_PART=$(part_path "$DISK" 3)
+    HOME_PART=$(part_path "$HOME_DISK" 1)
     wait_for_device "$EFI_PART"
     wait_for_device "$ROOT_PART"
-
+    wait_for_device "$HOME_PART"
     quietly mkfs.fat -F 32 -n EFI "$EFI_PART"
     quietly mkfs.ext4 -F -L SonaRoot "$ROOT_PART"
-
-    # On a wiped drive it is safe to also install GRUB to the fallback EFI
-    # path, so firmware that forgets boot entries can still start Sona.
+    quietly mkfs.ext4 -F -L SonaHome "$HOME_PART"
     GRUB_REMOVABLE="yes"
-fi
+    ;;
+existing)
+    step "Preparing the disk" "Formatting $ROOT_PART."
+    umount "$ROOT_PART" 2>/dev/null || true
+    swapoff "$ROOT_PART" 2>/dev/null || true
+    quietly wipefs -af "$ROOT_PART"
+    quietly mkfs.ext4 -F -L SonaRoot "$ROOT_PART"
+    ;;
+mounted)
+    step "Preparing the disk" "Using what is mounted at /mnt."
+    ;;
+esac
 
-mount "$ROOT_PART" /mnt
+if [[ "$PART_MODE" != mounted ]]; then
+    mount "$ROOT_PART" /mnt
+fi
 MOUNTED=true
+if [[ -n "$HOME_PART" ]]; then
+    mkdir -p /mnt/home
+    mount "$HOME_PART" /mnt/home
+fi
 if [[ -n "$EFI_PART" ]]; then
-    mkdir -p /mnt/boot/efi
-    mount "$EFI_PART" /mnt/boot/efi
+    if [[ "$PART_MODE" != mounted ]]; then
+        mkdir -p /mnt/boot/efi
+        mount "$EFI_PART" /mnt/boot/efi
+    fi
     esp_free=$(df --output=avail -m /mnt/boot/efi | tail -n 1 | tr -d ' ')
     if [[ "$esp_free" -lt 20 ]]; then
         err "The EFI partition $EFI_PART has only ${esp_free} MB free. Sona needs at least 20 MB there for its boot loader."
@@ -992,6 +1336,15 @@ GRUB_REMOVABLE=$(printf '%q' "$GRUB_REMOVABLE")
 INSTALL_AUR=$(printf '%q' "$(yes_or_no "$(ans INSTALL_AUR yes)")")
 SERIAL_CONSOLE=$(printf '%q' "$(yes_or_no "$(ans SERIAL_CONSOLE no)")")
 INSTALL_METHOD=$(printf '%q' "$INSTALL_METHOD")
+AUTOLOGIN_USER=$(printf '%q' "$AUTOLOGIN_USER")
+EXTRA_USERS=(${EXTRA_USERS[@]:+$(printf '%q ' "${EXTRA_USERS[@]}")})
+EXTRA_FULLNAMES=(${EXTRA_FULLNAMES[@]:+$(printf '%q ' "${EXTRA_FULLNAMES[@]}")})
+EXTRA_PASSWORDS=(${EXTRA_PASSWORDS[@]:+$(printf '%q ' "${EXTRA_PASSWORDS[@]}")})
+EXTRA_ADMINS=(${EXTRA_ADMINS[@]:+$(printf '%q ' "${EXTRA_ADMINS[@]}")})
+GAME_MANAGER=$(printf '%q' "$GAME_MANAGER")
+AUDIOGAME_MANAGER=$(printf '%q' "$AUDIOGAME_MANAGER")
+STEAM=$(printf '%q' "$STEAM")
+SSH=$(printf '%q' "$SSH")
 ONLINE=$(printf '%q' "$ONLINE")
 SONA_X_PKGS=($(printf '%q ' "${SONA_X_PKGS[@]}"))
 SONA_DESKTOP_PKGS=($(printf '%q ' "${SONA_DESKTOP_PKGS[@]}"))
@@ -1027,6 +1380,14 @@ QUICK_TEST="${QUICK_TEST:-n}"
 
 INSTALL_METHOD="${INSTALL_METHOD:-download}"
 ONLINE="${ONLINE:-y}"
+AUTOLOGIN_USER="${AUTOLOGIN_USER:-}"
+GAME_MANAGER="${GAME_MANAGER:-n}"
+AUDIOGAME_MANAGER="${AUDIOGAME_MANAGER:-n}"
+STEAM="${STEAM:-n}"
+SSH="${SSH:-n}"
+for list in EXTRA_USERS EXTRA_FULLNAMES EXTRA_PASSWORDS EXTRA_ADMINS; do
+    declare -p "$list" >/dev/null 2>&1 || declare -a "$list=()"
+done
 
 # Install what is not installed yet. (After copying the live system nearly
 # everything already is.) The package databases are synced once in step 6;
@@ -1426,7 +1787,7 @@ if [[ "$AUTOLOGIN" == "y" ]]; then
     {
         echo "[Service]"
         echo "ExecStart="
-        printf '%s\n' "ExecStart=-/sbin/agetty -o '-p -f -- \\\\u' --noclear --autologin $USERNAME %I \$TERM"
+        printf '%s\n' "ExecStart=-/sbin/agetty -o '-p -f -- \\\\u' --noclear --autologin ${AUTOLOGIN_USER:-$USERNAME} %I \$TERM"
     } > /etc/systemd/system/getty@tty1.service.d/10-sona-autologin.conf
 fi
 
@@ -1828,8 +2189,14 @@ if [[ -f /root/sona-extras/orca-bridge/remote.orca-ext ]]; then
     rm -rf /usr/share/sona/orca-bridge
     cp -r /root/sona-extras/orca-bridge /usr/share/sona/orca-bridge
     install -m755 /usr/share/sona/orca-bridge/sona-orca-extensions /usr/local/bin/sona-orca-extensions
+    # Orca settings chosen on the live system (voice, speech engine, rate)
+    # go to every user too; Install saved them in orca-settings.ini.
+    if [[ -s /root/sona-extras/orca-settings.ini ]]; then
+        export SONA_DCONF_EXTRA=/root/sona-extras/orca-settings.ini
+    fi
     sona-orca-extensions /etc/skel || echo "Warning: the Orca extensions could not be set up in /etc/skel."
     sona-orca-extensions "/home/$USERNAME" "$USERNAME" || echo "Warning: the Orca extensions could not be set up for $USERNAME."
+    unset SONA_DCONF_EXTRA
 fi
 
 # Kokoro neural voices, an extra Speech Dispatcher synthesizer
@@ -1931,6 +2298,71 @@ fi
 
 chown -R "$USERNAME:$USERNAME" "/home/$USERNAME"
 
+# 18b. Optional extras chosen in the installer.
+progress "Installing the extras you chose."
+if [[ "$GAME_MANAGER" == y || "$AUDIOGAME_MANAGER" == y ]]; then
+    groupadd -f games
+    gpasswd -a "$USERNAME" games >/dev/null
+fi
+# install_game_manager NAME: the same way Stormux does it. A git checkout in
+# /opt that members of the games group can update, and a launcher.
+install_game_manager() {
+    local name="$1" dir="/opt/$1"
+    if [[ "$ONLINE" != y ]]; then
+        echo "Warning: no internet, so $name was not installed. Later: sudo git clone https://git.stormux.org/storm/$name $dir"
+        return 0
+    fi
+    rm -rf "$dir"
+    if ! git clone --quiet "https://git.stormux.org/storm/$name" "$dir"; then
+        echo "Warning: could not download $name, so it was skipped."
+        return 0
+    fi
+    git -C "$dir" config core.sharedRepository group
+    git -C "$dir" config safe.directory "$dir"
+    git config --system --add safe.directory "$dir"
+    chown -R root:games "$dir"
+    chmod -R 775 "$dir"
+    find "$dir" -type d -exec chmod g+s {} +
+    cat > "/usr/local/bin/$name" << GAME_LAUNCHER
+#!/usr/bin/env bash
+# Start $name, updating it first (members of the games group can update it).
+cd $dir || exit 1
+umask 002
+git pull --quiet 2>/dev/null || true
+exec ./$name.sh "\$@"
+GAME_LAUNCHER
+    chmod 755 "/usr/local/bin/$name"
+    echo "$name is installed in $dir. Run it with: $name"
+}
+[[ "$GAME_MANAGER" == y ]] && install_game_manager linux-game-manager
+[[ "$AUDIOGAME_MANAGER" == y ]] && install_game_manager audiogame-manager
+if [[ "$STEAM" == y ]]; then
+    install_optional steam
+fi
+if [[ "$SSH" == y ]]; then
+    if pac_install openssh; then
+        systemctl enable sshd.service
+    else
+        echo "Warning: SSH could not be installed. Later: sudo pacman -S openssh && sudo systemctl enable --now sshd"
+    fi
+fi
+
+# 18c. More user accounts. Made last, so their home folders start from the
+# finished /etc/skel: login files, desktop icons, Orca extensions, and the
+# Orca settings from the live system.
+for i in "${!EXTRA_USERS[@]}"; do
+    extra="${EXTRA_USERS[$i]}"
+    groups="input,lp,sys,audio"
+    [[ "${EXTRA_ADMINS[$i]}" == y ]] && groups="wheel,$groups"
+    getent group games >/dev/null && groups="$groups,games"
+    progress "Creating the user account $extra."
+    useradd -m -c "${EXTRA_FULLNAMES[$i]}" -G "$groups" -s /bin/bash "$extra"
+    echo "$extra:${EXTRA_PASSWORDS[$i]}" | chpasswd
+    mkdir -p "/home/$extra/.config"
+    cp /etc/xdg/mimeapps.list "/home/$extra/.config/mimeapps.list" 2>/dev/null || true
+    chown -R "$extra:$extra" "/home/$extra"
+done
+
 # 19. Refresh the boot menu now that everything is installed, so it also
 progress "Finishing the boot menu."
 # lists Windows or other systems found by os-prober. GRUB itself was
@@ -1954,6 +2386,20 @@ elif ! curl -fsSL "https://github.com/chasecichorz/sona/archive/refs/heads/main.
         tar -xz --strip-components=1 -C /mnt/root/sona-extras \
             sona-main/orca-bridge sona-main/kokoro sona-main/packages sona-main/xp-theme; then
     echo "Warning: could not download Sona's extras (Orca Bridge, Kokoro, OpenEVV, XP theme), so they were skipped."
+fi
+# The Orca settings used on the live system (speech engine, voice, rate,
+# and so on), so the new accounts start with the same speech. Extension
+# approvals are left out; they are made again for the new system.
+if [[ -d /home/sona/.config/dconf ]] && id sona >/dev/null 2>&1; then
+    live_orca=$(runuser -u sona -- env HOME=/home/sona XDG_CONFIG_HOME=/home/sona/.config \
+        XDG_RUNTIME_DIR="/run/user/$(id -u sona)" dconf dump /org/gnome/orca/ 2>/dev/null || true)
+    if [[ -n "$live_orca" ]]; then
+        printf '%s\n' "$live_orca" | awk '
+            /^\[/ { sub(/^\[\/?/, ""); sub(/\]$/, ""); print "[org/gnome/orca" ($0 == "" ? "" : "/" $0) "]"; next }
+            /^approved-user-extensions=/ { next }
+            { print }' > /mnt/root/sona-extras/orca-settings.ini
+        echo "Saved the live system's Orca settings for the new users." >> "$LOG"
+    fi
 fi
 [[ "$XP_THEME" == "y" ]] || rm -rf /mnt/root/sona-extras/xp-theme /mnt/root/sona-extras/xp-sounds
 
@@ -1984,15 +2430,49 @@ step "Finishing" "Unmounting the new system."
 umount -R /mnt
 MOUNTED=false
 
+# A short chord when the install is done (the same idea as the Stormux
+# installer). Played as the desktop user when run with sudo, so it reaches
+# their sound server; never stops the installer.
+play_done_sound() {
+    command -v play >/dev/null 2>&1 || return 0
+    local chord=(-qnV0 synth 3 pluck D3 pluck A3 pluck D4 pluck F4 pluck A4 delay 0 .1 .2 .3 .4 remix - chorus 0.9 0.9 38 0.75 0.3 0.5 -t)
+    if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != root ]]; then
+        runuser -u "$SUDO_USER" -- env XDG_RUNTIME_DIR="/run/user/$(id -u "$SUDO_USER")" play "${chord[@]}" >/dev/null 2>&1 || true
+    else
+        play "${chord[@]}" >/dev/null 2>&1 || true
+    fi
+}
+
+# What happened, from the log: how many warnings, and what they said.
+warn_lines=$(grep -i -E '^(warning|==> warning)' "$LOG" | grep -v -i -E 'is newer than|up to date|database file for|os-prober|cannot detect type of overlayfs|sd-vconsole|from target list because it conflicts|directory permissions differ|Public keyring not found' || true)
+if [[ -n "$warn_lines" ]]; then
+    warn_count=$(printf '%s\n' "$warn_lines" | wc -l)
+else
+    warn_count=0
+fi
+if [[ "$warn_count" -eq 0 ]]; then
+    finish_summary="Sona Linux has been installed, with no warnings."
+else
+    finish_summary="Sona Linux has been installed, with $warn_count warnings. They do not stop Sona from working, but read them in case something needs doing later:
+
+$(printf '%s\n' "$warn_lines" | head -n 20)"
+fi
+finish_summary+="
+
+The install log is saved on the new system as /var/log/sona-install.log."
+
 if [[ "$UNATTENDED" == yes ]]; then
     case "$(ans FINISH reboot)" in
         reboot)   echo "Sona Linux has been installed. Rebooting."; reboot ;;
         poweroff) echo "Sona Linux has been installed. Powering off."; poweroff ;;
-        none)     echo "Sona Linux has been installed." ;;
+        none)     printf '%s\n' "$finish_summary" ;;
         *)        echo "Sona Linux has been installed. (Unknown FINISH value; not rebooting.)" ;;
     esac
     exit 0
 fi
 
-ui_msg "Installation Complete" "Sona Linux has been installed! Remove your installation media and press Enter to reboot."
+play_done_sound
+ui_msg "Installation Complete" "$finish_summary
+
+Remove the USB stick or disc, then press Enter to restart into Sona."
 reboot

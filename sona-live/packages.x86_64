@@ -133,8 +133,6 @@ xlibre-video-vesa
 mesa
 sonicde-meta
 terminator
-lightdm
-lightdm-gtk-greeter
 orca
 speech-dispatcher
 espeak-ng
