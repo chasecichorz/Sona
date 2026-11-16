@@ -107,6 +107,13 @@ fi
 # also put on the ISO, so an offline install can trust the same repositories.
 # With "bundle-only", the key is only put on the ISO (the repository is not
 # used to build it, so this computer's keyring is left alone).
+# A fresh pacman keyring (for example in the GitHub build container) has no
+# local signing key yet, and pacman-key --lsign-key needs one.
+if ! gpg --homedir /etc/pacman.d/gnupg --list-secret-keys 2>/dev/null | grep -q '^sec'; then
+    pacman-key --init
+    pacman-key --populate archlinux
+fi
+
 trust_key() {
     local name="$1" url="$2" fpr="$3" mode="${4:-}" key_tmp got_fpr
     key_tmp="$(mktemp)"
