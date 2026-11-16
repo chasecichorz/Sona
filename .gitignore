@@ -3,3 +3,4 @@ work/
 out/
 # Made by scripts/build-iso.sh for each build
 work-profile/
+__pycache__/

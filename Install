@@ -568,7 +568,7 @@ setup_network() {
                 menu_items+=("$((i + 1))" "${SSIDS[$i]}")
             done
 
-            selected_idx=$(ui_menu "Select Wi-Fi Network" "Use Up and Down arrows or press a number to choose your Wi-Fi:" "${menu_items[@]}")
+            selected_idx=$(ui_menu "Select Wi-Fi Network" "Choose your Wi-Fi network:" "${menu_items[@]}")
 
             SELECTED_SSID="${SSIDS[$((selected_idx - 1))]}"
             WIFI_PASS=$(ui_pass "Wi-Fi Password" "Enter the password for $SELECTED_SSID (leave blank if it is open):")
@@ -2313,7 +2313,7 @@ install_game_manager() {
         return 0
     fi
     rm -rf "$dir"
-    if ! git clone --quiet "https://git.stormux.org/storm/$name" "$dir"; then
+    if ! timeout 600 git clone --quiet "https://git.stormux.org/storm/$name" "$dir"; then
         echo "Warning: could not download $name, so it was skipped."
         return 0
     fi

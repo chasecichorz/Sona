@@ -165,7 +165,17 @@ Gotchas we already hit:
 
 ## Current state (update this)
 
-As of 2026-11-13:
+Validation update, 2026-11-15:
+
+- Existing November 13 ISO passed copy-online (82 checks), copy-offline
+  (78), live USB (13), live RAM (16), interactive install (16), and full
+  UEFI and BIOS install/desktop boot. BIOS rerun passed after reboot.
+- Stormux key trust and repository sync passed in both live boot modes.
+- Working directory contains uncommitted installer wording/clone timeout
+  changes and the new interactive/live VM tests with parser regressions.
+  No rebuilt ISO includes these working-directory edits yet.
+
+Earlier build and release state, 2026-11-13:
 
 - Merged into `main` and pushed once (commit 8d52184). **Chase asked to stop
   pushing to GitHub for now:** commit locally on `sonicde` only, no `git push`,
@@ -201,6 +211,61 @@ As of 2026-11-13:
    starts the GitHub ISO build and VM install test (about two hours).
 
 ## Handoff log (newest first; add a line when you stop)
+
+- 2026-11-16, Claude Code: Chase asked to push everything to main. Committed
+  the installer wording/clone-timeout edits and the interactive/live VM tests
+  (lint and the three regression tests pass), fast-forwarded main to sonicde
+  and pushed both. A new local ISO build (out/sona-2026.11.16-x86_64.iso,
+  includes these edits) was running at the time of the push; host needed
+  python-pip installed for build-iso.sh.
+
+- 2026-11-15, Codex: reran the approved BIOS validation command successfully.
+  Although ordinary session inspection cannot see /dev/kvm, the approved
+  execution path ran the VM successfully. Installation completed and the
+  installed system reached both login and SonicDE; validation-bios.log
+  records PASS. All pending existing-ISO validation is now complete. Updated
+  Current state; no new ISO build, commit, push, or USB write performed.
+
+- 2026-11-15, Codex, after reboot: recovered validation logs. Copy online
+  passed 82/82, offline 78/78; live USB 13/13, RAM 16/16; interactive
+  install 16/16; UEFI full install reached login and SonicDE and passed.
+  Live checks include Orca running, extension approval, installer shortcut,
+  Stormux key trust and syncing all repositories. BIOS validation was
+  interrupted during initial mirror selection; no final result. No QEMU
+  process remains. This agent session still has no /dev/kvm. Re-ran three
+  Python regression checks, bash -n and shellcheck -S error successfully.
+  Next: rerun BIOS validation from the host terminal. These results apply
+  to the existing November 13 ISO; no new build, USB write or push performed.
+
+- 2026-11-15, Codex: resumed on desktop. Postroom comparison: current
+  ~/email/postroom is clean at 663cccd, three commits ahead of clean laptop
+  copy at 1c7eec4; no laptop-only commits or uncommitted changes. Fixed
+  interactive /home fstab check to parse whitespace-delimited fields (the
+  old literal spaces reject genfstab tabs; installer bug is not established).
+  Fixed live test: explicit Bash shell, anchored completion markers to avoid
+  matching command echo, newline-delimited named results, exact expected
+  count (13 USB/16 RAM), explicit copytoram=n for USB, mode validation.
+  Serial driver now clears failed socket connections. Three local regression
+  checks in tests/test_vm_checks.py pass; bash -n and shellcheck -S error
+  pass for Install and both test scripts. Existing Install edits preserved.
+  VM/quick tests NOT rerun: agent environment has no /dev/kvm and sudo is
+  blocked by no-new-privileges (also reports sudo.conf owned by 65534).
+  Run privileged validation from the host terminal. No ISO build, commit,
+  push, host configuration change, or USB write performed.
+
+- 2026-11-14, Claude Code: **work moved to Chase's desktop** (192.168.4.30,
+  Core Ultra 7 265F, 32 GB; the laptop is being wiped). Project in `~/src/sona`
+  there, rest of the laptop home in `~/laptop-home`, laptop system files
+  (/etc, /opt, /root, /boot, /usr/local) in `~/laptop-system`, package and
+  service lists in `~/laptop-home/laptop-info`. Desktop has passwordless sudo,
+  qemu, archiso and the test tools. Results of the 22:32 ISO tests (not yet
+  in Current state): copy-online quick test 83/83; copy-offline did not run
+  (umount busy); interactive VM install 15/16, FAIL "/home is mounted from
+  its own partition at boot" (likely missing from fstab: fix next); live
+  boot tests usb/ram print "CHECK FAIL" with empty names (test-script result
+  parsing bug); full UEFI VM test was interrupted. Uncommitted: Install
+  (Wi-Fi prompt wording, timeout on game-manager git clone) and new
+  scripts interactive-install-test.sh, live-boot-test.sh, vm-serial.py.
 
 - 2026-11-13, Claude Code: quiet installer status box, XP default on again,
   15:12 ISO written to USB; studied the Stormux installer.
